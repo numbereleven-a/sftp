@@ -10,7 +10,19 @@ TAG="latest"
 ASSET="bin/SFTPplug.zip"
 ASSET_NAME="SFTPplug.zip"
 NOTES_FILE="release.txt"
-TITLE="v1.0.0.17"
+
+# Read version from src/include/version.h (single source of truth).
+VERSION_H="$REPO_DIR/src/include/version.h"
+if [ ! -f "$VERSION_H" ]; then
+    echo "❌ Nie znaleziono: $VERSION_H"
+    exit 1
+fi
+VERSION=$(grep -oE 'VER_FILEVERSION_STR[[:space:]]+"[0-9.]+"' "$VERSION_H" | grep -oE '[0-9.]+')
+if [ -z "$VERSION" ]; then
+    echo "❌ Nie udało się odczytać wersji z $VERSION_H"
+    exit 1
+fi
+TITLE="v$VERSION"
 
 cd "$REPO_DIR" || { echo "❌ Nie można przejść do: $REPO_DIR"; exit 1; }
 

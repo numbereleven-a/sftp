@@ -1,5 +1,22 @@
 # Release Notes
 
+## 13.05.2026 (v1.0.0.18)
+
+- **Modern OpenSSH key auth fixed (libssh2 → mbedTLS migration).** Public-key authentication regressed in v1.0.0.17 against modern OpenSSH servers (8.8+, including stock Ubuntu 24.04/26.04 with OpenSSH 10.x): the plugin silently fell back to password prompts even with valid `ed25519` and `RSA` keys. Root cause was the Windows WinCNG crypto backend used by libssh2 — it does not implement `ed25519`, `curve25519-sha256`, `AES-GCM`, and crucially missed RFC 4251 mpint encoding for RSA public keys (`gen_publickey_from_rsa` skipped the leading-zero rule, so the SHA-256 fingerprint of the client-presented pubkey never matched `authorized_keys` when the modulus had its MSB set — roughly half of all RSA keys).
+
+- **libssh2 now linked against mbedTLS 3.6.6** (statically, `/MT`, no DLLs) with three local patches against libssh2 1.11.1:
+  1. `int ret = 0` in `_libssh2_mbedtls_pub_priv_key` (was returning a garbage stack value as if it were an error code; MSVC C4701)
+  2. RFC 4251 mpint leading-zero handling in `gen_publickey_from_rsa` (matches the OpenSSL backend's `write_bn` semantics)
+  3. RSA-SHA2 default upgrade in `_libssh2_key_sign_algorithm` when the server omits `server-sig-algs` (SHA-1 RSA signatures are forbidden by OpenSSH 8.8+)
+
+- **Supported algorithms now include** `ssh-ed25519`, `ecdsa-sha2-nistp{256,384,521}`, `curve25519-sha256`, `mlkem768x25519-sha256`, AES-GCM ciphers, ChaCha20-Poly1305. Plugin grew ~1 MB (still single-file, no VC++ Redistributable required).
+
+- **Empty "Public key" field fix.** When the public-key path was left blank, the plugin passed a pointer to an empty buffer (not `NULL`) to libssh2, which then called `fopen("")` and failed with `LIBSSH2_ERROR_FILE` instead of deriving the public key from the private one. Fixed in `SftpAuth.cpp` — empty path is now correctly nullified.
+
+- **New build script** `build-deps.ps1` builds mbedTLS + libssh2 from sources under `thirdparty/` (CMake + Ninja, `/MT`), replacing the obsolete `third_party/build.ps1`. Output goes to `src/lib/`.
+
+---
+
 ## 24.03.2026 (v1.0.0.17)
 
 - **Language override:** Add `Language=` to `[Configuration]` in `sftpplug.ini` to force the plugin UI language independently of Total Commander's setting. Built-in codes: `en`, `pl`, `de`, `fr`, `es`, `it`, `ru`, `cs`, `hu`, `nl`, `pt-br`, `ro`, `sk`, `uk`, `ja`, `zh-cn`. Any other value is treated as a custom `.lng` filename stem — the plugin loads `language\<value>.lng` from the plugin directory, enabling translations not in the built-in list (e.g. Finnish: `Language=fin`). A ready-to-edit template `sftpplug.tpl` is included — copy it to `sftpplug.ini` and set the desired language.
