@@ -1,0 +1,26 @@
+# Release Notes
+
+## 24.03.2026 (v1.0.0.17)
+
+- **Language override:** Add `Language=` to `[Configuration]` in `sftpplug.ini` to force the plugin UI language independently of Total Commander's setting. Built-in codes: `en`, `pl`, `de`, `fr`, `es`, `it`, `ru`, `cs`, `hu`, `nl`, `pt-br`, `ro`, `sk`, `uk`, `ja`, `zh-cn`. Any other value is treated as a custom `.lng` filename stem — the plugin loads `language\<value>.lng` from the plugin directory, enabling translations not in the built-in list (e.g. Finnish: `Language=fin`). A ready-to-edit template `sftpplug.tpl` is included — copy it to `sftpplug.ini` and set the desired language.
+
+- **LAN Pair — write access to TrustedInstaller-protected locations:** The **Trusted Installer** checkbox in the LAN Pair connection settings now correctly takes effect on every connect. On the **Donor** (server) side, incoming connections are served under TrustedInstaller impersonation — the remote Receiver can read and write files in `C:\Windows\`, `WinSxS`, `WindowsApps`, and other TI-owned directories. On the **Receiver** (client) side, a TI scope wraps local file access, enabling transfer to and from protected local paths. DPAPI trust keys use `CRYPTPROTECT_LOCAL_MACHINE` for TI-compatible decryption.
+
+---
+
+## Packaging and Installation
+
+Distribution archive: `SFTPplug.zip`
+
+| File | Purpose |
+|------|---------|
+| `SFTPplug.wfx64` | x64 plugin binary (libssh2 + Argon2 statically linked, `/MT`) |
+| `SFTPplug.wfx` | x86 plugin binary (libssh2 + Argon2 statically linked, `/MT`) |
+| `pluginst.inf` | Total Commander auto-install descriptor (`file=` x86, `file64=` x64) |
+| `sftp.php` | PHP Agent script for HTTP transfer and shell modes |
+| `SFTPplug.chm` | Full offline documentation |
+| `readme.txt` | Package notes |
+| `sftpplug.tpl` | Configuration template — copy to `sftpplug.ini` to enable Language= and other settings |
+| `language\*.lng` | 15 language files (PL/RU/DE/FR/ES/IT/CS/HU/NL/PT-BR/RO/SK/UK/JA/ZH-CN) |
+
+**Installation:** No external DLLs required. libssh2 and Argon2 are statically linked (`/MT`) — no VC++ Redistributable needed. Open `SFTPplug.zip` in Total Commander and press Enter to trigger the plugin install prompt.
