@@ -35,8 +35,7 @@
 ; Add this to a saved session section when the SSH server does not expose the
 ; standard "sftp" subsystem, but an SFTP server binary can be started manually.
 ; This is equivalent to OpenSSH's `sftp -s /path/to/sftp-server`.
-; Currently this option is configured manually in this ini file and is not shown
-; in the connection dialog.
+; This value can be set in the connection dialog or manually in this ini file.
 ;
 ; Example:
 ;[OpenWrt]

@@ -289,8 +289,7 @@ sftpservercommand=/usr/lib/sftp-server
 This starts SFTP with an SSH `exec` request, equivalent to OpenSSH's
 `sftp -s /path/to/sftp-server host`.
 
-Currently this option is configured manually in `sftpplug.ini` and is not shown
-in the connection dialog.
+The value can be set in the connection dialog or manually in `sftpplug.ini`.
 
 ### SCP (Native)
 
