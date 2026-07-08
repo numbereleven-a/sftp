@@ -1,4 +1,18 @@
-# Secure FTP Plugin for Total Commander
+# Secure FTP Plugin for Total Commander - custom build
+
+This fork adds support for starting SFTP through a custom server command.
+
+Use it when an SSH server rejects the standard SFTP subsystem request, but can run an SFTP server binary manually. This is useful for setups such as OpenWrt 25.x with Dropbear.
+
+Example:
+
+```ini
+sftpservercommand=/usr/lib/sftp-server
+```
+
+Latest custom release: [v10.0.0.18 - custom SFTP server command](https://github.com/numbereleven-a/sftp/releases/tag/v10.0.0.18-custom-sftp-command)
+
+![Custom SFTP server command dialog](images/custom-sftp-server-command-dialog.png)
 
 > [!IMPORTANT]
 > **2026-05-13 — Modern OpenSSH key auth fixed (libssh2 mbedTLS migration)**
