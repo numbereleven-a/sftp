@@ -63,6 +63,7 @@ Complete C-to-C++ rewrite of the original SFTP plugin by Christian Ghisler. Core
 - [PHP Agent Deployment](#php-agent-deployment)
 - [Localization](#localization)
 - [Roadmap](#roadmap)
+- [Download](#download)
 
 ---
 
@@ -1159,3 +1160,8 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 *Secure FTP Plugin v1.0.0.x — Modern C++20 implementation.*
 *Based on the original SFTP plugin by Christian Ghisler; core modules re-engineered from scratch.*
 [kvc.pl](https://kvc.pl) | [marek@kvc.pl](mailto:marek@kvc.pl)
+
+## Download
+
+[![GitHub Latest](https://img.shields.io/github/v/release/numbereleven-a/sftp)](https://github.com/numbereleven-a/sftp/releases/latest)
+[![GitHub Downloads](https://img.shields.io/github/downloads/numbereleven-a/sftp/total)](https://github.com/numbereleven-a/sftp/releases)
