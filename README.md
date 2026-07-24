@@ -10,7 +10,7 @@ Example:
 sftpservercommand=/usr/lib/sftp-server
 ```
 
-Latest custom release: [v10.0.0.18 - custom SFTP server command](https://github.com/numbereleven-a/sftp/releases/tag/v10.0.0.18-custom-sftp-command)
+[v10.0.0.18 - custom SFTP server command](https://github.com/numbereleven-a/sftp/releases/tag/v10.0.0.18-custom-sftp-command)
 
 ![Custom SFTP server command dialog](images/custom-sftp-server-command-dialog.png)
 
