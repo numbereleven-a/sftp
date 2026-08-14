@@ -410,6 +410,20 @@ function tar_write_header(string $name, int $size, int $mtime, string $type, $ou
     return true;
 }
 
+function tar_write_all($out, string $data): bool
+{
+    $offset = 0;
+    $length = strlen($data);
+    while ($offset < $length) {
+        $written = fwrite($out, substr($data, $offset));
+        if ($written === false || $written === 0) {
+            return false;
+        }
+        $offset += $written;
+    }
+    return true;
+}
+
 function tar_build_header(string $name, int $size, int $mtime, string $type): string
 {
     $h = str_repeat("\0", 512);
@@ -586,24 +600,36 @@ function op_tar_pack(): void
             if (!tar_write_header($relPath, $size, $mtime, '0', $mem)) {
                 continue;
             }
+            $remaining = $size;
             $fh = fopen($real, 'rb');
-            if ($fh === false) {
-                fwrite($mem, str_repeat("\0", (($size + 511) & ~511)));
-                continue;
-            }
-            $written = 0;
-            while (!feof($fh)) {
-                $chunk = fread($fh, 65536);
-                if ($chunk === false) {
-                    break;
+            if ($fh !== false) {
+                while ($remaining > 0) {
+                    $chunk = fread($fh, min(65536, $remaining));
+                    if ($chunk === false || $chunk === '') {
+                        break;
+                    }
+                    if (!tar_write_all($mem, $chunk)) {
+                        fclose($fh);
+                        exit;
+                    }
+                    $remaining -= strlen($chunk);
                 }
-                fwrite($mem, $chunk);
-                $written += strlen($chunk);
+                fclose($fh);
             }
-            fclose($fh);
-            $pad = (($size + 511) & ~511) - $written;
-            if ($pad > 0) {
-                fwrite($mem, str_repeat("\0", $pad));
+
+            // The header already declared $size bytes. Ignore appended data,
+            // or zero-fill a truncated file, so the next header stays aligned.
+            while ($remaining > 0) {
+                $fill = min(65536, $remaining);
+                if (!tar_write_all($mem, str_repeat("\0", $fill))) {
+                    exit;
+                }
+                $remaining -= $fill;
+            }
+
+            $pad = (($size + 511) & ~511) - $size;
+            if ($pad > 0 && !tar_write_all($mem, str_repeat("\0", $pad))) {
+                exit;
             }
         }
     }

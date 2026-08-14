@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <condition_variable>
 #include <algorithm>
 #include <thread>
 #include <vector>
@@ -808,8 +809,16 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
     std::string         password_;
     std::atomic<bool>   trustedInstaller_{false};
 
-    std::mutex               clientThreadsMu_;
-    std::vector<std::thread> clientThreads_;
+    struct ClientWorker {
+        std::thread                        thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
+    std::mutex                clientThreadsMu_;
+    std::condition_variable   clientThreadsCv_;
+    std::vector<ClientWorker> clientThreads_;
+    std::thread               clientReaperThread_;
+    bool                      clientReaperStop_ = false;
 
     static constexpr char kDefaultPeerId[] = "lanfilesrv";
 
@@ -1178,28 +1187,74 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
                                    reinterpret_cast<sockaddr*>(&from), &fromLen);
             if (client == INVALID_SOCKET) continue;
 
-            {
-                std::lock_guard<std::mutex> lk(clientThreadsMu_);
-                clientThreads_.erase(
-                    std::remove_if(clientThreads_.begin(), clientThreads_.end(),
-                                   [](std::thread& t) { return !t.joinable(); }),
-                    clientThreads_.end());
-            }
-
             auto self = shared_from_this();
+            auto done = std::make_shared<std::atomic<bool>>(false);
             std::lock_guard<std::mutex> lk(clientThreadsMu_);
-            clientThreads_.emplace_back([self, client] {
-                sftp::DllExceptionBarrier barrier;
-                sftp::dll_invoke_void(barrier, [self, client] { self->handleClient(client); });
+            clientThreads_.push_back(ClientWorker{
+                std::thread([self, client, done] {
+                    {
+                        sftp::DllExceptionBarrier barrier;
+                        sftp::dll_invoke_void(barrier, [self, client] { self->handleClient(client); });
+                    }
+                    done->store(true, std::memory_order_release);
+                    self->clientThreadsCv_.notify_one();
+                }),
+                std::move(done)
             });
         }
     }
 
-    void joinClientThreads() {
-        std::lock_guard<std::mutex> lk(clientThreadsMu_);
-        for (auto& t : clientThreads_)
-            if (t.joinable()) t.join();
-        clientThreads_.clear();
+    void runClientReaper() {
+        for (;;) {
+            std::vector<std::thread> completed;
+            bool stopping = false;
+            {
+                std::unique_lock<std::mutex> lk(clientThreadsMu_);
+                clientThreadsCv_.wait(lk, [this] {
+                    return clientReaperStop_ ||
+                           std::any_of(clientThreads_.begin(), clientThreads_.end(),
+                               [](const ClientWorker& worker) {
+                                   return worker.done->load(std::memory_order_acquire);
+                               });
+                });
+
+                stopping = clientReaperStop_;
+                for (auto it = clientThreads_.begin(); it != clientThreads_.end();) {
+                    if (stopping || it->done->load(std::memory_order_acquire)) {
+                        completed.push_back(std::move(it->thread));
+                        it = clientThreads_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
+            for (auto& thread : completed) {
+                if (thread.joinable())
+                    thread.join();
+            }
+            if (stopping)
+                return;
+        }
+    }
+
+    void startClientReaper() {
+        {
+            std::lock_guard<std::mutex> lk(clientThreadsMu_);
+            clientReaperStop_ = false;
+        }
+        auto self = shared_from_this();
+        clientReaperThread_ = std::thread([self] { self->runClientReaper(); });
+    }
+
+    void stopClientReaper() {
+        {
+            std::lock_guard<std::mutex> lk(clientThreadsMu_);
+            clientReaperStop_ = true;
+        }
+        clientThreadsCv_.notify_one();
+        if (clientReaperThread_.joinable())
+            clientReaperThread_.join();
     }
 };
 
@@ -1254,6 +1309,7 @@ bool LanFileServer::start(uint16_t port, lanpair::PairError* err) noexcept {
     }
 
     impl_->running_ = true;
+    impl_->startClientReaper();
     impl_->acceptThread_ = std::thread([this] {
         sftp::DllExceptionBarrier barrier;
         sftp::dll_invoke_void(barrier, [this] { impl_->runAcceptLoop(); });
@@ -1267,7 +1323,7 @@ void LanFileServer::stop() noexcept {
     impl_->closeListen();
     if (impl_->acceptThread_.joinable())
         impl_->acceptThread_.join();
-    impl_->joinClientThreads();
+    impl_->stopClientReaper();
 }
 
 bool LanFileServer::isRunning() const noexcept {

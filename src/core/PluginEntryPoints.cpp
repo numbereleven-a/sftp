@@ -82,12 +82,29 @@ static LANGID DetectTcUiLangIdFromIni(const char* tcIniPath) noexcept
         return 0;
     }
 
-    // Normalize to uppercase to make matching robust across naming conventions.
+    // Match only the language token in the file name. Searching the full path
+    // can mis-detect a language from an unrelated directory name.
     CharUpperBuffA(languageIni.data(), static_cast<DWORD>(strlen(languageIni.data())));
     std::string normalized(languageIni.data());
+    const size_t pathSep = normalized.find_last_of("\\/");
+    std::string stem = pathSep == std::string::npos
+        ? normalized
+        : normalized.substr(pathSep + 1);
+    if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".LNG") == 0) {
+        stem.resize(stem.size() - 4);
+    }
 
-    auto has = [&normalized](const char* token) noexcept -> bool {
-        return normalized.find(token) != std::string::npos;
+    auto hasCode = [&stem](const char* code) noexcept -> bool {
+        const size_t codeLen = strlen(code);
+        if (stem.size() < codeLen ||
+            stem.compare(stem.size() - codeLen, codeLen, code) != 0) {
+            return false;
+        }
+        if (stem.size() == codeLen) {
+            return true;
+        }
+        const char separator = stem[stem.size() - codeLen - 1];
+        return separator == '_' || separator == '.' || separator == '-';
     };
 
     // Common TC naming patterns:
@@ -106,52 +123,53 @@ static LANGID DetectTcUiLangIdFromIni(const char* tcIniPath) noexcept
     // - WCMD_SK.LNG / WCMD_SKY.LNG
     // - WCMD_UA.LNG / WCMD_UKR.LNG
     // - WCMD_SC.LNG / WCMD_CHS.LNG
-    if (has("_PL") || has(".PL") || has("POL")) {
+    if (hasCode("PL") || hasCode("POL")) {
         return MAKELANGID(LANG_POLISH, SUBLANG_DEFAULT);
     }
-    if (has("_DE") || has(".DE") || has("DEU") || has("GER")) {
+    if (hasCode("DE") || hasCode("DEU") || hasCode("GER")) {
         return MAKELANGID(LANG_GERMAN, SUBLANG_GERMAN);
     }
-    if (has("_FR") || has(".FR") || has("FRA") || has("FRE")) {
+    if (hasCode("FR") || hasCode("FRA") || hasCode("FRE")) {
         return MAKELANGID(LANG_FRENCH, SUBLANG_FRENCH);
     }
-    if (has("_ES") || has(".ES") || has("ESP") || has("SPA")) {
+    if (hasCode("ES") || hasCode("ESP") || hasCode("SPA")) {
         return MAKELANGID(LANG_SPANISH, SUBLANG_SPANISH_MODERN);
     }
-    if (has("_IT") || has(".IT") || has("ITA")) {
+    if (hasCode("IT") || hasCode("ITA")) {
         return MAKELANGID(LANG_ITALIAN, SUBLANG_ITALIAN);
     }
-    if (has("_RU") || has(".RU") || has("RUS")) {
+    if (hasCode("RU") || hasCode("RUS")) {
         return MAKELANGID(LANG_RUSSIAN, SUBLANG_DEFAULT);
     }
-    if (has("_CZ") || has(".CZ") || has("CSY") || has("_CS")) {
+    if (hasCode("CZ") || hasCode("CSY") || hasCode("CS")) {
         return MAKELANGID(LANG_CZECH, SUBLANG_DEFAULT);
     }
-    if (has("_HU") || has(".HU") || has("HUN")) {
+    if (hasCode("HU") || hasCode("HUN")) {
         return MAKELANGID(LANG_HUNGARIAN, SUBLANG_DEFAULT);
     }
-    if (has("_JP") || has(".JP") || has("JPN")) {
+    if (hasCode("JP") || hasCode("JPN")) {
         return MAKELANGID(LANG_JAPANESE, SUBLANG_DEFAULT);
     }
-    if (has("_NL") || has(".NL") || has("NLD") || has("HOL")) {
+    if (hasCode("NL") || hasCode("NLD") || hasCode("HOL")) {
         return MAKELANGID(LANG_DUTCH, SUBLANG_DUTCH);
     }
-    if (has("_BR") || has("PTB") || has("PT-B")) {
+    if (hasCode("BR") || hasCode("PTB") || hasCode("PT-B")) {
         return MAKELANGID(LANG_PORTUGUESE, SUBLANG_PORTUGUESE_BRAZILIAN);
     }
-    if (has("_RO") || has(".RO") || has("ROM") || has("RUM")) {
+    if (hasCode("RO") || hasCode("ROM") || hasCode("RUM")) {
         return MAKELANGID(LANG_ROMANIAN, SUBLANG_DEFAULT);
     }
-    if (has("_SK") || has(".SK") || has("SKY")) {
+    if (hasCode("SK") || hasCode("SKY")) {
         return MAKELANGID(LANG_SLOVAK, SUBLANG_DEFAULT);
     }
-    if (has("_UA") || has(".UA") || has("UKR") || has("_UK")) {
+    if (hasCode("UA") || hasCode("UKR") || hasCode("UK")) {
         return MAKELANGID(LANG_UKRAINIAN, SUBLANG_DEFAULT);
     }
-    if (has("_SC") || has("_CN") || has("CHS") || has("CHI") || has("CHN")) {
+    if (hasCode("SC") || hasCode("CN") || hasCode("CHS") ||
+        hasCode("CHI") || hasCode("CHN")) {
         return MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED);
     }
-    if (has("_EN") || has(".EN") || has("ENU") || has("ENG")) {
+    if (hasCode("EN") || hasCode("ENU") || hasCode("ENG")) {
         return MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US);
     }
 
