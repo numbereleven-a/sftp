@@ -36,12 +36,12 @@ static std::string LngStrA(UINT id, const char* fallback)
 constexpr int SFTP_SCP_CHANNEL_OPEN_TIMEOUT_MS = 20000;
 constexpr int64_t SFTP_SPEED_STATS_MIN_BYTES = 300LL * 1000LL * 1000LL;
 constexpr int RECV_BLOCK_SIZE = 32768;
-constexpr int SCP_IO_POLL_SLEEP_MS = 10;
 
 // Helper: wait for SCP I/O with timeout
 template<typename F>
 bool ScpWaitFor(pConnectSettings cs, bool forWrite, DWORD timeoutMs, F&& op)
 {
+    (void)forWrite;
     const auto start = std::chrono::steady_clock::now();
     int rc;
     do {
@@ -54,10 +54,7 @@ bool ScpWaitFor(pConnectSettings cs, bool forWrite, DWORD timeoutMs, F&& op)
             std::chrono::steady_clock::now() - start).count();
         if (elapsed > timeoutMs)
             return false;
-        if (forWrite)
-            IsSocketWritable(cs->sock);
-        else
-            IsSocketReadable(cs->sock);
+        WaitForSshIo(cs);
     } while (true);
 }
 
@@ -209,9 +206,8 @@ void ShowTransferSpeedIfLarge(LPCSTR prefix, int64_t bytesTransferred, SYSTICKS 
 
 bool ScpWaitIo(pConnectSettings cs, bool forWrite)
 {
-    if (!cs || cs->sock == INVALID_SOCKET)
-        return false;
-    return forWrite ? IsSocketWritable(cs->sock) : IsSocketReadable(cs->sock);
+    (void)forWrite;
+    return WaitForSshIo(cs);
 }
 
 bool ScpWriteAll(ISshChannel* channel, pConnectSettings cs, const char* data, size_t len, DWORD timeoutMs)
@@ -236,7 +232,6 @@ bool ScpWriteAll(ISshChannel* channel, pConnectSettings cs, const char* data, si
         if (elapsed > static_cast<long long>(timeoutMs))
             return false;
         ScpWaitIo(cs, true);
-        Sleep(SCP_IO_POLL_SLEEP_MS);
     }
     return true;
 }
@@ -260,7 +255,6 @@ bool ScpReadByte(ISshChannel* channel, pConnectSettings cs, char* outByte, DWORD
         if (elapsed > static_cast<long long>(timeoutMs))
             return false;
         ScpWaitIo(cs, false);
-        Sleep(SCP_IO_POLL_SLEEP_MS);
     }
 }
 
@@ -356,7 +350,7 @@ bool OpenScpDownloadChannel(pConnectSettings cs, const char* filename,
                     ShowStatusId(IDS_LOG_SCP_OPEN_TIMEOUT, nullptr, true);
                     break;
                 }
-                IsSocketReadable(cs->sock);
+                WaitForSshIo(cs);
             } else if (!didReconnect &&
                        (err == LIBSSH2_ERROR_SOCKET_DISCONNECT ||
                         err == LIBSSH2_ERROR_SOCKET_RECV ||
@@ -494,7 +488,7 @@ int ShellScpDownloadFile(pConnectSettings cs,
                     ShowStatus("SCP download stalled.");
                     return SFTP_READFAILED;
                 }
-                IsSocketReadable(cs->sock);
+                WaitForSshIo(cs);
             } else {
                 return SFTP_READFAILED;
             }

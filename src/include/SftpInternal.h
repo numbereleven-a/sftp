@@ -8,6 +8,7 @@
 #include <array>
 #include <vector>
 #include <string>
+#include <chrono>
 #include <cstdint>  // for int8_t
 
 inline bool IsPhpAgentTransport(const pConnectSettings cs) noexcept
@@ -118,6 +119,32 @@ bool  IsSocketError(SOCKET s);
 bool  IsSocketWritable(SOCKET s);
 bool  IsSocketReadable(SOCKET s);
 bool  WaitForTransportReadable(pConnectSettings cs);
+bool  WaitForSshIo(pConnectSettings cs, DWORD timeoutMs = SOCKET_READ_POLL_MS);
+bool  StartSshKeepAlive(pConnectSettings cs);
+void  StopSshKeepAlive(pConnectSettings cs);
+
+// Retry a libssh2 operation without a fixed-interval busy wait.  libssh2
+// exposes the socket direction that is currently blocked; WaitForSshIo()
+// turns that into a readiness wait and also handles ProxyJump transports.
+template<typename F>
+int WaitForOperation(F&& op, DWORD timeoutMs, pConnectSettings cs)
+{
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        const int rc = op();
+        if (rc != LIBSSH2_ERROR_EAGAIN)
+            return rc;
+        if (EscapePressed())
+            return LIBSSH2_ERROR_EAGAIN;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed > static_cast<long long>(timeoutMs))
+            return LIBSSH2_ERROR_TIMEOUT;
+        if (!WaitForSshIo(cs, SOCKET_POLL_MS) &&
+            (!cs || (cs->sock == INVALID_SOCKET && !cs->transport_stream)))
+            Sleep(SOCKET_POLL_MS);
+    }
+}
 
 void  EncryptString(LPCTSTR pszPlain,     LPTSTR pszEncrypted, UINT cchEncrypted);
 void  DecryptString(LPCTSTR pszEncrypted, LPTSTR pszPlain,     UINT cchPlain);

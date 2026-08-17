@@ -25,6 +25,8 @@ typedef SSIZE_T ssize_t;
 //     <  0  — unrecoverable error
 //
 // Use ITRANSPORT_EAGAIN to signal would-block from implementations.
+struct ISshSession;
+
 struct ITransportStream {
     virtual ~ITransportStream() = default;
 
@@ -37,6 +39,12 @@ struct ITransportStream {
     // Block until the stream is readable or `timeoutMs` expires.
     // Returns true if data is available.
     virtual bool waitReadable(DWORD timeoutMs) = 0;
+
+    // Wait for the underlying stream to make progress in the direction
+    // reported by the nested SSH session.  A ProxyJump transport may need to
+    // watch both read and write readiness when the inner session is blocked
+    // on outbound data (window updates arrive on the read side).
+    virtual bool waitForSshIo(ISshSession* session, DWORD timeoutMs) = 0;
 
     // Human-readable description for logging.
     virtual const char* describe() const = 0;

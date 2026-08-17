@@ -1,8 +1,8 @@
-Secure FTP Plugin
+SFTP Plugin for Total Commander
 Copyright (C) Marek Wesolowski
 
 Help:
-- Open sftpplug.chm for full documentation.
+- Open sftpplug.chm for full documentation when it is included in the package.
 - You can also open help from the plugin connection dialog via the Help button.
 
 Installation:
@@ -23,6 +23,7 @@ Important:
 
 Highlights:
 - SFTP + SCP support
+- Optional SSH keepalive for idle SSH sessions (off by default; configurable interval)
 - Shell transfer fallback for restricted hosts
 - Jump Host / ProxyJump for bastion-routed SSH sessions
 - PHP Agent (HTTP) transfer mode for hosts without SSH account access
@@ -32,3 +33,5 @@ Highlights:
 - PPK/PEM key support
 - Password manager integration (TC master password)
 - 15-language localization (auto-detected from Total Commander settings)
+- TAR batch transfer fixes for files that change size during packaging
+- LAN Pair worker cleanup and improved ProxyJump/non-blocking SSH waits

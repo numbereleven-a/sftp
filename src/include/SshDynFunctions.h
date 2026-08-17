@@ -13,6 +13,8 @@ FUNCDEF(LIBSSH2_API const char *,libssh2_session_methods,(LIBSSH2_SESSION *sessi
 FUNCDEF(LIBSSH2_API int ,libssh2_session_last_error,(LIBSSH2_SESSION *session, char **errmsg, int *errmsg_len, int want_buf));
 FUNCDEF(LIBSSH2_API int ,libssh2_session_last_errno,(LIBSSH2_SESSION *session));
 FUNCDEF(LIBSSH2_API int ,libssh2_session_flag,(LIBSSH2_SESSION *session, int flag, int value));
+FUNCDEF(LIBSSH2_API void, libssh2_keepalive_config,(LIBSSH2_SESSION *session, int want_reply, unsigned int interval));
+FUNCDEF(LIBSSH2_API int, libssh2_keepalive_send,(LIBSSH2_SESSION *session, int *seconds_to_next));
 FUNCDEF(LIBSSH2_API char *,libssh2_userauth_list,(LIBSSH2_SESSION *session, const char *username, unsigned int username_len));
 FUNCDEF(LIBSSH2_API int ,libssh2_userauth_authenticated,(LIBSSH2_SESSION *session));
 FUNCDEF(LIBSSH2_API int ,libssh2_userauth_password_ex,(LIBSSH2_SESSION *session, const char *username, unsigned int username_len, const char *password, unsigned int password_len, LIBSSH2_PASSWD_CHANGEREQ_FUNC((*passwd_change_cb))));

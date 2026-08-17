@@ -1,5 +1,6 @@
 #include "global.h"
 #include <windows.h>
+#include <cerrno>
 #include <array>
 #include <memory>
 #include <format>
@@ -42,10 +43,8 @@ static ssize_t transport_send_cb(
 {
     auto* cs = static_cast<tConnectSettings*>(*abstract);
     ssize_t rc = cs->transport_stream->write(buffer, length);
-    if (rc == ITRANSPORT_EAGAIN) {
-        WSASetLastError(WSAEWOULDBLOCK);
-        return -1;
-    }
+    if (rc == ITRANSPORT_EAGAIN)
+        return -EAGAIN;
     return rc;
 }
 
@@ -57,10 +56,8 @@ static ssize_t transport_recv_cb(
 {
     auto* cs = static_cast<tConnectSettings*>(*abstract);
     ssize_t rc = cs->transport_stream->read(buffer, length);
-    if (rc == ITRANSPORT_EAGAIN) {
-        WSASetLastError(WSAEWOULDBLOCK);
-        return -1;
-    }
+    if (rc == ITRANSPORT_EAGAIN)
+        return -EAGAIN;
     return rc;
 }
 

@@ -155,6 +155,15 @@ struct tConnectSettings {
     // but BEFORE cs->sock is closed.
     std::unique_ptr<ITransportStream> transport_stream;
 
+    // Optional SSH-level keepalive.  Disabled by default and loaded from
+    // [Configuration] keepalive/keepaliveinterval in sftpplug.ini.
+    bool ssh_keepalive_enabled = false;
+    unsigned int ssh_keepalive_interval = 30;
+    bool ssh_keepalive_runtime = false;
+    UINT_PTR ssh_keepalive_timer = 0;
+    DWORD ssh_keepalive_timer_thread = 0;
+    HWND ssh_keepalive_timer_window = nullptr;
+
     WCHAR current_sourceW[wdirtypemax];
     WCHAR current_targetW[wdirtypemax];
     std::unique_ptr<IUserFeedback> feedback;

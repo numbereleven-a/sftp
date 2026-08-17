@@ -12,7 +12,7 @@
 
 #pragma comment(lib, "version.lib")
 
-// Reads FileVersion from own VERSIONINFO resource, returns e.g. "1.0.0.10"
+// Reads FileVersion from own VERSIONINFO resource.
 // Returns empty string on failure.
 std::wstring GetPluginVersionW()
 {
@@ -67,7 +67,7 @@ void OpenPluginHelp(HWND hWnd)
         return;
     }
 
-    // Build title with version: "SFTP Plugin v1.0.0.10"
+    // Build the help title with the current plugin version.
     std::wstring helpTitle = L"SFTP Plugin";
     const std::wstring ver = GetPluginVersionW();
     if (!ver.empty())

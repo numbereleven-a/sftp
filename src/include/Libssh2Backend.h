@@ -12,7 +12,7 @@
 class Libssh2SftpHandle : public ISftpHandle {
 public:
     explicit Libssh2SftpHandle(LIBSSH2_SFTP_HANDLE* h) : handle_(h) {}
-    ~Libssh2SftpHandle() override = default;
+    ~Libssh2SftpHandle() override;
 
     ssize_t read(char* buf, size_t len) override;
     ssize_t write(const char* buf, size_t len) override;
@@ -31,7 +31,7 @@ private:
 class Libssh2Channel : public ISshChannel {
 public:
     explicit Libssh2Channel(LIBSSH2_CHANNEL* ch) : channel_(ch) {}
-    ~Libssh2Channel() override = default;
+    ~Libssh2Channel() override;
 
     ssize_t read(char* buf, size_t len) override;
     ssize_t readStderr(char* buf, size_t len) override;
@@ -77,7 +77,7 @@ private:
 class Libssh2SftpSession : public ISftpSession {
 public:
     explicit Libssh2SftpSession(LIBSSH2_SFTP* sftp) : sftp_(sftp) {}
-    ~Libssh2SftpSession() override = default;
+    ~Libssh2SftpSession() override;
 
     std::unique_ptr<ISftpHandle> open(const char* path, unsigned long flags,
                                       long mode) override;
@@ -103,7 +103,7 @@ private:
 class Libssh2Session : public ISshSession {
 public:
     explicit Libssh2Session(LIBSSH2_SESSION* s) : session_(s) {}
-    ~Libssh2Session() override = default;
+    ~Libssh2Session() override;
 
     int startup(int sock) override;
     void setBlocking(int blocking) override;
@@ -128,6 +128,8 @@ public:
     int lastErrno() override;
     int sessionFlag(int flag, int value) override;
     int blockDirections() override;
+    void keepaliveConfig(int wantReply, unsigned int interval) override;
+    int keepaliveSend(int* secondsToNext) override;
 
     std::unique_ptr<ISftpSession> sftpInit() override;
     std::unique_ptr<ISftpSession> sftpInitCommand(const char* command) override;
