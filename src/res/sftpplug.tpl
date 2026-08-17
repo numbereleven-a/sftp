@@ -7,6 +7,12 @@
 
 [Configuration]
 
+; SSH keepalive is disabled by default. Uncomment keepalive=1 to send
+; a small SSH keepalive packet while an SSH connection is idle.
+; The interval is in seconds and is clamped to 5..3600 seconds.
+;keepalive=1
+;keepaliveinterval=30
+
 ; Language= overrides the UI language detected from Total Commander.
 ; Use this when:
 ;   - TC is set to a language not in the supported 15 (e.g. Finnish, Turkish,

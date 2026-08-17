@@ -41,24 +41,10 @@ private:
         if (!channel_ || !cs_)
             return;
 
-        auto wait = [&](auto fn, DWORD timeoutMs) {
-            const SYSTICKS start = get_sys_ticks();
-            int rc;
-            do {
-                rc = fn();
-                if (rc != LIBSSH2_ERROR_EAGAIN)
-                    return rc;
-                if (EscapePressed() || get_ticks_between(start) > static_cast<int>(timeoutMs))
-                    break;
-                Sleep(25);
-            } while (true);
-            return rc;
-        };
-
-        wait([&] { return channel_->sendEof(); }, 1000);
-        wait([&] { return channel_->waitEof(); }, 1000);
-        wait([&] { return channel_->channelClose(); }, 1000);
-        wait([&] { return channel_->channelFree(); }, 2000);
+        WaitForOperation([this] { return channel_->sendEof(); }, 1000, cs_);
+        WaitForOperation([this] { return channel_->waitEof(); }, 1000, cs_);
+        WaitForOperation([this] { return channel_->channelClose(); }, 1000, cs_);
+        WaitForOperation([this] { return channel_->channelFree(); }, 2000, cs_);
         delete channel_;
     }
 

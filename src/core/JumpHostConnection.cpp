@@ -130,6 +130,25 @@ public:
         return select(0, &fds, nullptr, nullptr, &tv) > 0;
     }
 
+    bool waitForSshIo(ISshSession* sess, DWORD timeoutMs) override
+    {
+        if (sock_ == INVALID_SOCKET)
+            return false;
+        const int dirs = sess ? sess->blockDirections() : 0;
+        fd_set rfds, wfds;
+        FD_ZERO(&rfds);
+        FD_ZERO(&wfds);
+        // SSH control packets (including window updates) arrive on read even
+        // when the nested target session reports an outbound block.
+        FD_SET(sock_, &rfds);
+        if (dirs & LIBSSH2_SESSION_BLOCK_OUTBOUND)
+            FD_SET(sock_, &wfds);
+        struct timeval tv {};
+        tv.tv_sec = static_cast<long>(timeoutMs / 1000);
+        tv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
+        return select(0, &rfds, &wfds, nullptr, &tv) > 0;
+    }
+
     const char* describe() const override { return desc_.c_str(); }
 
     void close() override
@@ -238,9 +257,24 @@ static bool AuthJumpHost(
     int&                loop,
     SYSTICKS&           lasttime)
 {
-    // Get available auth methods.
-    char* authList = jmpSession->userauthList(
-        jump.user.c_str(), static_cast<unsigned>(jump.user.size()));
+    // The jump session is non-blocking, so the first probe may need to wait
+    // for the server's auth-method response.
+    char* authList = nullptr;
+    const SYSTICKS authProbeStart = get_sys_ticks();
+    do {
+        authList = jmpSession->userauthList(
+            jump.user.c_str(), static_cast<unsigned>(jump.user.size()));
+        if (authList)
+            break;
+        if (jmpSession->lastErrno() != LIBSSH2_ERROR_EAGAIN)
+            break;
+        if (get_ticks_between(authProbeStart) > SSH_PROBE_TIMEOUT_MS)
+            break;
+        if (ProgressLoop("Jump host: querying auth methods...",
+                         progress, progress + 2, &loop, &lasttime))
+            break;
+        IsSocketReadable(jmpSock);
+    } while (true);
 
     if (!authList && jmpSession->userauthAuthenticated()) {
         ShowStatusId(IDS_LOG_JUMP_AUTH_NONE, nullptr, true);
@@ -261,7 +295,7 @@ static bool AuthJumpHost(
             agent->listIdentities();
             struct libssh2_agent_publickey* prev = nullptr;
             struct libssh2_agent_publickey* id   = nullptr;
-            while (agent->getIdentity(&id, prev) == 1) {
+            while (agent->getIdentity(&id, prev) == 0) {
                 int r = LIBSSH2_ERROR_EAGAIN;
                 while (r == LIBSSH2_ERROR_EAGAIN) {
                     r = agent->userauth(jump.user.c_str(), id);

@@ -62,7 +62,7 @@ std::unique_ptr<ISftpHandle> OpenSftpFileWithRetry(
             ShowStatusId(IDS_LOG_SFTP_OPEN_TIMEOUT, nullptr, true);
             break;
         }
-        IsSocketReadable(cs->sock);
+        WaitForSshIo(cs);
     } while (!handle);
     return handle;
 }
@@ -144,26 +144,10 @@ public:
 
     int Close() {
         if (!channel_ || !cs_) return 0;
-        // Attempt graceful shutdown
-        auto wait = [&](auto fn, DWORD timeoutMs) {
-            const auto start = std::chrono::steady_clock::now();
-            int rc;
-            do {
-                rc = fn();
-                if (rc != LIBSSH2_ERROR_EAGAIN)
-                    return rc;
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - start).count();
-                if (elapsed > timeoutMs)
-                    break;
-                IsSocketReadable(cs_->sock);
-            } while (true);
-            return rc;
-        };
-        wait([this] { return channel_->sendEof(); }, 1000);
-        wait([this] { return channel_->waitEof(); }, 1000);
-        wait([this] { return channel_->channelClose(); }, 1000);
-        wait([this] { return channel_->channelFree(); }, 2000);
+        WaitForOperation([this] { return channel_->sendEof(); }, 1000, cs_);
+        WaitForOperation([this] { return channel_->waitEof(); }, 1000, cs_);
+        WaitForOperation([this] { return channel_->channelClose(); }, 1000, cs_);
+        WaitForOperation([this] { return channel_->channelFree(); }, 2000, cs_);
         channel_.reset();
         return 0;
     }
@@ -296,7 +280,7 @@ int DownloadLoop(pConnectSettings cs, Handle& remote, LocalFile& local,
                     break;
                 }
             }
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
         } else if (len < 0) {
             SftpLogLastError("Download read error: ", len);
             ret = SFTP_READFAILED;
@@ -524,7 +508,7 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
             do {
                 rc = remoteSftp->get()->fstat(&attr, 0);
                 if (rc == LIBSSH2_ERROR_EAGAIN)
-                    IsSocketReadable(cs->sock);
+                    WaitForSshIo(cs);
             } while (rc == LIBSSH2_ERROR_EAGAIN);
             // Check if server actually returned size (some servers may not honor the flag)
             if (rc == 0 && (attr.flags & LIBSSH2_SFTP_ATTR_SIZE) && attr.filesize > 0) {
@@ -623,7 +607,7 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
                 do {
                     int rc = cs->sftpsession->setstat(remotePath.c_str(), &attr);
                     if (rc != LIBSSH2_ERROR_EAGAIN) break;
-                    IsSocketReadable(cs->sock);
+                    WaitForSshIo(cs);
                 } while (true);
             }
         }

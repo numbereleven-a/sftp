@@ -87,7 +87,7 @@ int CleanupFailedConnect(
             rc = cs->sftpsession->shutdown();
             if (ProgressLoop(progressTextBuf.data(), *ioProgress, 90, ioLoop, ioLastTime))
                 break;
-            WaitForTransportReadable(cs);
+            WaitForSshIo(cs);
         } while (rc == LIBSSH2_ERROR_EAGAIN);
         cs->sftpsession.reset();
         *ioProgress = 90;
@@ -98,7 +98,7 @@ int CleanupFailedConnect(
             rc2 = cs->session->disconnect("Shutdown");
             if (ProgressLoop(progressTextBuf.data(), *ioProgress, 100, ioLoop, ioLastTime))
                 break;
-            WaitForTransportReadable(cs);
+            WaitForSshIo(cs);
         } while (rc2 == LIBSSH2_ERROR_EAGAIN);
         cs->session->free();
         cs->session.reset();
@@ -106,7 +106,6 @@ int CleanupFailedConnect(
     // Release transport stream AFTER the target session is already freed
     // (above) but BEFORE the jump socket closes.
     cs->transport_stream.reset();
-    Sleep(RECONNECT_SLEEP_MS);
     if (cs->sock != INVALID_SOCKET) {
         closesocket(cs->sock);
         cs->sock = INVALID_SOCKET;

@@ -244,7 +244,7 @@ int SftpFindFirstFileW(pConnectSettings cs, LPCWSTR remotedir, LPVOID* davdatapt
                         writeFailed = true;
                         break;
                     }
-                    IsSocketReadable(cs->sock);
+                    WaitForSshIo(cs);
                 }
             }
 
@@ -332,10 +332,9 @@ int SftpFindFirstFileW(pConnectSettings cs, LPCWSTR remotedir, LPVOID* davdatapt
                     return SFTP_FAILED;
             }
         } else {
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
         }
 
-        Sleep(50);
         int delta = get_ticks_between(cs->findstarttime);
         if (delta > kSftpProgressStartMs && aborttime == -1) {
             if (ProgressProc(PluginNumber, dirStr.c_str(), "temp", (delta / kSftpProgressDivMs) % 100))
@@ -395,7 +394,7 @@ int SftpFindNextFileW(pConnectSettings cs, LPVOID davdataptr, LPWIN32_FIND_DATAW
             cs->neednewchannel = true;
             break;
         }
-        IsSocketReadable(cs->sock);
+        WaitForSshIo(cs);
     }
 
     if (rc > 0) {
@@ -467,7 +466,7 @@ int SftpFindClose(pConnectSettings cs, LPVOID davdataptr)
             cs->neednewchannel = true;
             break;
         }
-        IsSocketReadable(cs->sock);
+        WaitForSshIo(cs);
     }
     delete dirhandle;
     return SFTP_OK;
@@ -514,7 +513,6 @@ int SftpCreateDirectoryW(pConnectSettings cs, LPCWSTR Path)
         rc = cs->sftpsession->mkdir(dirStr.c_str(), cs->dirmod);
         if (rc == 0)
             break;
-        Sleep(50);
         int delta = get_ticks_between(cs->findstarttime);
         if (delta > kSftpProgressStartMs && aborttime == -1) {
             if (EscapePressed())
@@ -526,7 +524,7 @@ int SftpCreateDirectoryW(pConnectSettings cs, LPCWSTR Path)
             break;
         }
         if (rc == LIBSSH2_ERROR_EAGAIN)
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
     } while (rc == LIBSSH2_ERROR_EAGAIN);
 
     if (rc == 0) {
@@ -541,7 +539,7 @@ int SftpCreateDirectoryW(pConnectSettings cs, LPCWSTR Path)
                     break;
                 }
                 if (rc == LIBSSH2_ERROR_EAGAIN)
-                    IsSocketReadable(cs->sock);
+                    WaitForSshIo(cs);
             } while (rc == LIBSSH2_ERROR_EAGAIN);
         }
         return SFTP_OK;
@@ -604,7 +602,7 @@ int SftpDeleteFileW(pConnectSettings cs, LPCWSTR RemoteName, bool isdir)
                 std::chrono::steady_clock::now() - writeStart).count();
             if (elapsed > kScpWriteTimeoutMs)
                 return SFTP_FAILED;
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
         }
 
         std::vector<std::string> lines;
@@ -635,7 +633,7 @@ int SftpDeleteFileW(pConnectSettings cs, LPCWSTR RemoteName, bool isdir)
             break;
         }
         if (rc == LIBSSH2_ERROR_EAGAIN)
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
     } while (rc == LIBSSH2_ERROR_EAGAIN);
 
     if (rc == 0)
@@ -679,7 +677,7 @@ int SftpRenameMoveFileW(pConnectSettings cs, LPCWSTR OldName, LPCWSTR NewName, b
         do {
             lrc = cs->sftpsession->lstat(newNameA.data(), &attr);
             if (lrc == LIBSSH2_ERROR_EAGAIN)
-                IsSocketReadable(cs->sock);
+                WaitForSshIo(cs);
         } while (lrc == LIBSSH2_ERROR_EAGAIN);
         if (lrc >= 0)
             return SFTP_EXISTS;
@@ -689,7 +687,7 @@ int SftpRenameMoveFileW(pConnectSettings cs, LPCWSTR OldName, LPCWSTR NewName, b
     do {
         rc = cs->sftpsession->rename(oldNameA.data(), newNameA.data());
         if (rc == LIBSSH2_ERROR_EAGAIN)
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
     } while (rc == LIBSSH2_ERROR_EAGAIN);
     return (rc == 0) ? SFTP_OK : SFTP_FAILED;
 }
@@ -712,7 +710,7 @@ int SftpSetAttr(pConnectSettings cs, LPCSTR RemoteName, int NewAttr)
     do {
         rc = cs->sftpsession->lstat(nameStr.c_str(), &attrs);
         if (rc == LIBSSH2_ERROR_EAGAIN)
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
     } while (rc == LIBSSH2_ERROR_EAGAIN);
 
     if (rc != 0 || !(attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS))
@@ -730,7 +728,7 @@ int SftpSetAttr(pConnectSettings cs, LPCSTR RemoteName, int NewAttr)
     do {
         rc = cs->sftpsession->setstat(nameStr.c_str(), &attrs);
         if (rc == LIBSSH2_ERROR_EAGAIN)
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
     } while (rc == LIBSSH2_ERROR_EAGAIN);
 
     return (rc == 0) ? SFTP_OK : SFTP_FAILED;
@@ -753,7 +751,7 @@ int SftpSetDateTimeW(pConnectSettings cs, LPCWSTR RemoteName, LPFILETIME LastWri
     do {
         rc = cs->sftpsession->setstat(nameA.data(), &attr);
         if (rc == LIBSSH2_ERROR_EAGAIN)
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
     } while (rc == LIBSSH2_ERROR_EAGAIN);
     return (rc == 0) ? SFTP_OK : SFTP_FAILED;
 }
@@ -807,7 +805,7 @@ bool SftpLinkFolderTargetW(pConnectSettings cs, LPWSTR RemoteName, size_t maxlen
                                           static_cast<unsigned>(targetBuf.size()) - 1,
                                           LIBSSH2_SFTP_READLINK);
             if (rc == LIBSSH2_ERROR_EAGAIN)
-                IsSocketReadable(cs->sock);
+                WaitForSshIo(cs);
         } while (rc == LIBSSH2_ERROR_EAGAIN && get_ticks_between(start) < 5000);
 
         if (rc <= 0)
@@ -829,7 +827,7 @@ bool SftpLinkFolderTargetW(pConnectSettings cs, LPWSTR RemoteName, size_t maxlen
             rc = cs->sftpsession->realpath(targetBuf.c_str(), realBuf.data(),
                                            static_cast<int>(realBuf.size()) - 1);
             if (rc == LIBSSH2_ERROR_EAGAIN)
-                IsSocketReadable(cs->sock);
+                WaitForSshIo(cs);
         } while (rc == LIBSSH2_ERROR_EAGAIN && get_ticks_between(start2) < 5000);
 
         if (rc > 0) {
@@ -877,7 +875,7 @@ bool SftpLinkFolderTargetW(pConnectSettings cs, LPWSTR RemoteName, size_t maxlen
             if (std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - t0).count() > kScpWriteTimeoutMs)
                 return false;
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
         }
 
         std::vector<std::string> lines;
@@ -910,7 +908,7 @@ bool SftpLinkFolderTargetW(pConnectSettings cs, LPWSTR RemoteName, size_t maxlen
         rc = cs->sftpsession->realpath(".", realBuf.data(),
                                          static_cast<int>(realBuf.size()) - 1);
         if (rc == LIBSSH2_ERROR_EAGAIN)
-            IsSocketReadable(cs->sock);
+            WaitForSshIo(cs);
     } while (rc == LIBSSH2_ERROR_EAGAIN && get_ticks_between(start) < 5000);
 
     if (rc > 0) {

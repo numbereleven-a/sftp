@@ -44,6 +44,18 @@ bool LoadServerSettings(LPCSTR DisplayName, pConnectSettings ConnectResults, LPC
     std::array<char, 6> modbuf{};
     ConnectResults->DisplayName = DisplayName ? DisplayName : "";
     ConnectResults->IniFileName = iniFileName ? iniFileName : "";
+    // Plugin-wide SSH keepalive defaults.  Keepalive is deliberately off
+    // unless explicitly enabled in [Configuration].
+    ConnectResults->ssh_keepalive_enabled =
+        GetPrivateProfileInt("Configuration", "keepalive", 0, iniFileName) != 0;
+    const int keepaliveSeconds = GetPrivateProfileInt(
+        "Configuration", "keepaliveinterval", 30, iniFileName);
+    ConnectResults->ssh_keepalive_interval = static_cast<unsigned int>(
+        keepaliveSeconds < 5 ? 5 : (keepaliveSeconds > 3600 ? 3600 : keepaliveSeconds));
+    ConnectResults->ssh_keepalive_runtime = false;
+    ConnectResults->ssh_keepalive_timer = 0;
+    ConnectResults->ssh_keepalive_timer_thread = 0;
+    ConnectResults->ssh_keepalive_timer_window = nullptr;
     std::array<char, MAX_PATH> serverBuf{};
     GetPrivateProfileString(DisplayName, "server", "", serverBuf.data(), serverBuf.size() - 1, iniFileName);
     ConnectResults->server = serverBuf.data();

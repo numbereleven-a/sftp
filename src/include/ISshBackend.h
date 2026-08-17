@@ -133,6 +133,8 @@ struct ISshSession {
     virtual int lastErrno() = 0;
     virtual int sessionFlag(int flag, int value) = 0;
     virtual int blockDirections() = 0;
+    virtual void keepaliveConfig(int wantReply, unsigned int interval) = 0;
+    virtual int keepaliveSend(int* secondsToNext) = 0;
 
     virtual std::unique_ptr<ISftpSession> sftpInit() = 0;
     virtual std::unique_ptr<ISftpSession> sftpInitCommand(const char* command) = 0;

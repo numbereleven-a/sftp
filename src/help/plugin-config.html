@@ -30,7 +30,23 @@
     <td><em>(follows TC)</em></td>
     <td>Overrides the plugin UI language. See <a href="#language">Language override</a> below.</td>
   </tr>
+  <tr>
+    <td><code>keepalive</code></td>
+    <td><code>0</code></td>
+    <td>Set to <code>1</code> to enable SSH keepalive packets for idle connections.</td>
+  </tr>
+  <tr>
+    <td><code>keepaliveinterval</code></td>
+    <td><code>30</code></td>
+    <td>Keepalive interval in seconds; accepted range is 5–3600.</td>
+  </tr>
 </table>
+
+<h2 id="keepalive">SSH keepalive</h2>
+<p>By default the plugin sends no extra packets. To keep an idle SSH connection alive, add these lines to the <code>[Configuration]</code> section:</p>
+<pre>keepalive=1
+keepaliveinterval=30</pre>
+<p><code>keepaliveinterval</code> is measured in seconds and accepts values from 5 to 3600. This is SSH-level traffic, so it is useful when a server or firewall disconnects an otherwise idle session.</p>
 
 <h2 id="language">Language override</h2>
 <p>By default the plugin detects the language from Total Commander's own setting (<code>wincmd.ini</code> → <code>LanguageIni</code>). The <code>Language=</code> key overrides this detection.</p>

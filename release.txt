@@ -1,8 +1,20 @@
 # Release Notes
 
-## 13.05.2026 (v1.0.0.18)
+## SFTPplug 10.1.0.0
 
-- **Modern OpenSSH key auth fixed (libssh2 → mbedTLS migration).** Public-key authentication regressed in v1.0.0.17 against modern OpenSSH servers (8.8+, including stock Ubuntu 24.04/26.04 with OpenSSH 10.x): the plugin silently fell back to password prompts even with valid `ed25519` and `RSA` keys. Root cause was the Windows WinCNG crypto backend used by libssh2 — it does not implement `ed25519`, `curve25519-sha256`, `AES-GCM`, and crucially missed RFC 4251 mpint encoding for RSA public keys (`gen_publickey_from_rsa` skipped the leading-zero rule, so the SHA-256 fingerprint of the client-presented pubkey never matched `authorized_keys` when the modulus had its MSB set — roughly half of all RSA keys).
+- Fixed Pageant identity enumeration so available agent keys are no longer skipped during authentication.
+- Fixed ProxyJump authentication probing, target backend initialization, and nested read/write readiness handling.
+- Replaced fixed-interval SSH sleeps and read-only polling with bounded, event-driven waits based on libssh2's actual block direction.
+- Added bounded RAII-style cleanup for SFTP handles, channels, SFTP sessions, and SSH sessions when libssh2 temporarily returns `EAGAIN`.
+- Added optional SSH-level keepalive for idle SSH connections. It is disabled by default, supports a configurable 5–3600 second interval, and uses 30 seconds when enabled without a custom interval. The timer is attached to Total Commander's message loop so packets are dispatched reliably.
+
+The keepalive feature uses SSH protocol traffic only; it does not send synthetic file operations and does not override a server's own idle-timeout policy.
+
+---
+
+## 13.05.2026 (v10.0.0.18)
+
+- **Modern OpenSSH key auth fixed (libssh2 → mbedTLS migration).** Public-key authentication regressed in v10.0.0.17 against modern OpenSSH servers (8.8+, including stock Ubuntu 24.04/26.04 with OpenSSH 10.x): the plugin silently fell back to password prompts even with valid `ed25519` and `RSA` keys. Root cause was the Windows WinCNG crypto backend used by libssh2 — it does not implement `ed25519`, `curve25519-sha256`, `AES-GCM`, and crucially missed RFC 4251 mpint encoding for RSA public keys (`gen_publickey_from_rsa` skipped the leading-zero rule, so the SHA-256 fingerprint of the client-presented pubkey never matched `authorized_keys` when the modulus had its MSB set — roughly half of all RSA keys).
 
 - **libssh2 now linked against mbedTLS 3.6.6** (statically, `/MT`, no DLLs) with three local patches against libssh2 1.11.1:
   1. `int ret = 0` in `_libssh2_mbedtls_pub_priv_key` (was returning a garbage stack value as if it were an error code; MSVC C4701)
@@ -17,7 +29,7 @@
 
 ---
 
-## 24.03.2026 (v1.0.0.17)
+## 24.03.2026 (v10.0.0.17)
 
 - **Language override:** Add `Language=` to `[Configuration]` in `sftpplug.ini` to force the plugin UI language independently of Total Commander's setting. Built-in codes: `en`, `pl`, `de`, `fr`, `es`, `it`, `ru`, `cs`, `hu`, `nl`, `pt-br`, `ro`, `sk`, `uk`, `ja`, `zh-cn`. Any other value is treated as a custom `.lng` filename stem — the plugin loads `language\<value>.lng` from the plugin directory, enabling translations not in the built-in list (e.g. Finnish: `Language=fin`). A ready-to-edit template `sftpplug.tpl` is included — copy it to `sftpplug.ini` and set the desired language.
 

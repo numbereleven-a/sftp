@@ -1,23 +1,23 @@
-# Secure FTP Plugin for Total Commander - custom build
+# SFTP Plugin for Total Commander
 
-This fork adds support for starting SFTP through a custom server command.
+A maintained C++20 SFTP/SCP/PHP/LAN plugin for Total Commander, available for both x64 and x86.
 
-Use it when an SSH server rejects the standard SFTP subsystem request, but can run an SFTP server binary manually. This is useful for setups such as OpenWrt 25.x with Dropbear.
+The plugin supports several transfer paths and automatically uses the one selected in the connection profile: native SFTP, native SCP, shell transfer, PHP Agent over HTTP, or direct LAN Pair. It is designed for ordinary OpenSSH installations as well as restricted systems such as OpenWrt/Dropbear.
 
-Example:
+For servers that reject the standard SFTP subsystem request but can run an SFTP server binary manually, configure a custom command in the connection profile:
 
-```ini
-sftpservercommand=/usr/lib/sftp-server
-```
+  ```ini
+  sftpservercommand=/usr/lib/sftp-server
+  ```
 
-[v10.0.0.18 - custom SFTP server command](https://github.com/numbereleven-a/sftp/releases/tag/v10.0.0.18-custom-sftp-command)
+The optional keepalive setting sends SSH protocol traffic only. It is intended for idle-connection handling by firewalls, NAT devices, and servers; it does not emulate file activity or change a server's own idle-timeout policy.
 
-![Custom SFTP server command dialog](images/custom-sftp-server-command-dialog.png)
+![SFTP connection dialog with SSH keepalive](images/custom-sftp-server-command-dialog.png)
 
 > [!IMPORTANT]
-> **2026-05-13 — Modern OpenSSH key auth fixed (libssh2 mbedTLS migration)**
+> **Modern OpenSSH key authentication**
 >
-> Public-key authentication regressed in v10.0.0.17 against modern OpenSSH servers (8.8+, including stock Ubuntu 24.04/26.04 with OpenSSH 10.x): the plugin silently fell back to password prompts even with valid `ed25519` and `RSA` keys.
+> Public-key authentication works with modern OpenSSH servers (8.8+, including stock Ubuntu 24.04/26.04 with OpenSSH 10.x) using valid `ed25519` and `RSA` keys.
 >
 > Root cause: the bundled libssh2 was built against the Windows WinCNG crypto backend, which does not implement `ed25519`, `curve25519-sha256`, `AES-GCM`, or RFC 4251 mpint encoding for RSA public keys (`gen_publickey_from_rsa` missed the leading-zero rule, so the SHA-256 fingerprint of the client-presented pubkey never matched `authorized_keys` when the modulus had its MSB set — roughly half of real keys).
 >
@@ -36,7 +36,7 @@ sftpservercommand=/usr/lib/sftp-server
 
 ![SFTP Plugin](images/sftp01.jpg)
 
-**Version 1.0.0.x** — Modern C++20 SFTP/SCP/PHP/LAN plugin for Total Commander x64 and x86.
+Modern C++20 SFTP/SCP/PHP/LAN plugin for Total Commander x64 and x86.
 
 Complete C-to-C++ rewrite of the original SFTP plugin by Christian Ghisler. Core transport, authentication, and session modules were re-engineered from scratch with a compatibility-first execution model, interface-driven backend abstraction, and hardened security primitives. The plugin selects the optimal transfer path at runtime — native SFTP, native SCP, shell chunk transfer via `cat`/`dd`/`base64`, PHP Agent over HTTP, or direct LAN Pair — depending on server constraints and deployment topology.
 
@@ -108,6 +108,7 @@ Complete C-to-C++ rewrite of the original SFTP plugin by Christian Ghisler. Core
 - Session import from PuTTY Portable: select the PuTTY Portable folder — the plugin finds `putty.reg` automatically (recursive search up to 4 levels deep).
 - Session import from KiTTY Portable: select the KiTTYPortable root — the plugin finds the `Sessions` folder automatically (recursive search up to 4 levels deep); individual session files, only SSH sessions imported; stored passwords are automatically decrypted and saved to the plugin profile (DPAPI-protected).
 - Proxy support: HTTP CONNECT, SOCKS4, SOCKS4a, SOCKS5 (with or without credentials).
+- Optional SSH keepalive for idle SSH sessions (off by default; configurable from the connection dialog or `[Configuration]` in `sftpplug.ini`).
 - Dual-stack IPv4/IPv6 (`getaddrinfo`, `AF_INET6`).
 - Host key fingerprint verification with first-connection warning and change alert.
 - Remote checksum calculation without downloading: MD5, SHA1, SHA256, SHA512.
@@ -1135,6 +1136,11 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 - **PHP Agent TAR upload** — opt-in `php_tar` checkbox; directory F5 copy streams a single POSIX ustar TAR POST to `op=TAR_EXTRACT`; PHP extracts on-the-fly; GNU LongLink for long paths; two-pass Content-Length; works in foreground (`PUT_MULTI`) and background thread (`PUT_MULTI_THREAD`) modes; plain `.tar` file uploads unaffected
 - **PHP Agent TAR batch download** — opt-in `php_tar` checkbox; multi-file F5 copy sends a single POST to `op=TAR_PACK` with all remote paths; server streams ustar TAR directly without buffering (`php://output`); plugin parses TAR on-the-fly and writes local files; works in foreground (`GET_MULTI`) and background thread (`GET_MULTI_THREAD`) modes; GNU LongLink supported; files >8 GiB skipped cleanly
 - **PHP Agent TAR fixes** — DWORD overflow (TAR upload >4 GB now uses 64-bit `Content-Length` header); TAR pack no longer buffers in `php://temp` on server (eliminates HTTP 504 on OVH); per-file zero-pad allocation removed from upload loop; >8.5 GiB file guard in both C++ and PHP prevents TAR header corruption
+- **TAR_PACK source-change handling** — batch downloads use a stable source-size snapshot, ignore bytes appended after the snapshot, and keep the archive structurally valid when a source file becomes shorter during packaging
+- **LAN Pair worker cleanup** — completed client thread handles are reclaimed promptly instead of accumulating until plugin unload
+- **Language filename detection** — UI language is taken from the `.LNG` filename, not from directory-name substrings
+- **SSH keepalive** — optional SSH-level keepalive with a configurable 5–3600 second interval; disabled by default and available for direct SSH/ProxyJump sessions
+- **Bounded non-blocking SSH I/O** — readiness waits now honor libssh2 block directions and ProxyJump streams; libssh2 handles and sessions are closed with bounded EAGAIN cleanup
 - **libssh2 crypto backend migrated WinCNG → mbedTLS 3.6.6** — restores public-key auth against OpenSSH 8.8+/10.x servers (Ubuntu 24.04/26.04 default config). Adds support for `ed25519`, `ECDSA`, `curve25519-sha256`, `AES-GCM`, `mlkem768x25519`. Three local patches against libssh2 1.11.1: (1) `int ret = 0` in `_libssh2_mbedtls_pub_priv_key` (was returning stack garbage); (2) RFC 4251 mpint leading-zero handling in `gen_publickey_from_rsa` (without it, ≈50% of RSA keys produced the wrong on-wire pubkey hash → `PUBLICKEY_UNRECOGNIZED`); (3) RSA-SHA2 default upgrade in `_libssh2_key_sign_algorithm` when `server-sig-algs` is absent. Built statically `/MT` via new `build-deps.ps1`; plugin remains DLL-free
 
 ### In Progress
@@ -1155,9 +1161,9 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 
 ---
 
-**Highlights:** DllExceptionBarrier (ABI protection), ConnectionGuard RAII, LAN Pair TOFU/timeout, PHP Shell persistent history, 15-language localization (CS/HU/NL/PT-BR/RO/SK/UK/JA/ZH-CN added), checkbox session picker with 4-path memory, PuTTY Portable + WinSCP.ini + KiTTY Portable import, **KiTTY password import** (embedded dp.exe CAB + WMI/COM Defender exclusion + DPAPI), **PHP Agent TAR upload+download** (streaming ustar POST/GET, on-the-fly server extraction, batch download via TAR_PACK, no 4 GB limit), no VC++ Redistributable required
+**Highlights:** Optional SSH keepalive, event-driven SSH/ProxyJump I/O, bounded libssh2 cleanup, DllExceptionBarrier (ABI protection), ConnectionGuard RAII, LAN Pair TOFU/timeout, PHP Shell persistent history, 15-language localization, checkbox session picker with 4-path memory, PuTTY Portable + WinSCP.ini + KiTTY Portable import, **KiTTY password import**, no VC++ Redistributable required
 
-*Secure FTP Plugin v1.0.0.x — Modern C++20 implementation.*
+*Secure FTP Plugin — Modern C++20 implementation.*
 *Based on the original SFTP plugin by Christian Ghisler; core modules re-engineered from scratch.*
 [kvc.pl](https://kvc.pl) | [marek@kvc.pl](mailto:marek@kvc.pl)
 

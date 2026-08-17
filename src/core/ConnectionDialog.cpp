@@ -1406,6 +1406,16 @@ static void UpdateCertSectionState(HWND hWnd)
 void EnableControlsPageant(HWND hWnd, bool enable) { EnableCertSection(hWnd, enable); }
 void UpdateKeyControlsForPrivateKey(HWND hWnd)      { UpdateCertSectionState(hWnd); }
 
+static void UpdateKeepAliveControls(HWND hWnd)
+{
+    const int transferMode = (int)SendDlgItemMessage(hWnd, IDC_TRANSFERMODE, CB_GETCURSEL, 0, 0);
+    const bool sshMode = transferMode == static_cast<int>(sftp::TransferMode::ssh_auto);
+    const bool enabled = sshMode && IsDlgButtonChecked(hWnd, IDC_KEEPALIVE) == BST_CHECKED;
+    EnableWindow(GetDlgItem(hWnd, IDC_KEEPALIVE), sshMode ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hWnd, IDC_KEEPALIVE_INTERVAL_LABEL), enabled ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(hWnd, IDC_KEEPALIVE_INTERVAL), enabled ? TRUE : FALSE);
+}
+
 void UpdateScpOnlyDependentControls(HWND hWnd)
 {
     SendMessage(hWnd, WM_SETREDRAW, FALSE, 0);
@@ -1415,6 +1425,7 @@ void UpdateScpOnlyDependentControls(HWND hWnd)
     const bool phpShellMode = transferMode == static_cast<int>(sftp::TransferMode::php_shell);
     const bool scpOnly = IsDlgButtonChecked(hWnd, IDC_SCP_ALL) == BST_CHECKED;
     const bool phpAgentMode = transferMode == static_cast<int>(sftp::TransferMode::php_agent);
+    UpdateKeepAliveControls(hWnd);
     HWND scpData = GetDlgItem(hWnd, IDC_SCP_DATA);
     HWND shellTransfer = GetDlgItem(hWnd, IDC_SHELLTRANSFER);
     HWND scpAll = GetDlgItem(hWnd, IDC_SCP_ALL);
@@ -1617,6 +1628,11 @@ static void ApplyLoadedSessionToDialog(HWND hWnd, pConnectSettings s, LPCSTR ini
     CheckDlgButton(hWnd, IDC_SCP_DATA, s->scpfordata ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hWnd, IDC_SCP_ALL, s->scponly ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hWnd, IDC_SHELLTRANSFER, (s->shell_transfer_dd && s->shell_transfer_force) ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hWnd, IDC_KEEPALIVE, s->ssh_keepalive_enabled ? BST_CHECKED : BST_UNCHECKED);
+    SetDlgItemInt(hWnd, IDC_KEEPALIVE_INTERVAL,
+                  s->ssh_keepalive_interval >= 5 && s->ssh_keepalive_interval <= 3600
+                      ? s->ssh_keepalive_interval : 30,
+                  FALSE);
     CheckDlgButton(hWnd, IDC_JUMP_ENABLE, s->use_jump_host ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hWnd, IDC_PHP_TAR, s->php_tar ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(hWnd, IDC_LAN_TI, s->lan_pair_trusted_installer ? BST_CHECKED : BST_UNCHECKED);
@@ -2167,6 +2183,8 @@ INT_PTR ConnectionDialog::OnInitDialog(LPARAM /*lParam*/)
         { IDC_SYSTEMLABEL,        IDS_DLG_SYSTEM            },
         { IDC_CODEPAGELABEL,      IDS_DLG_ENCODING          },
         { IDC_SFTPSERVERCOMMAND_LABEL, IDS_DLG_SFTP_SERVER_COMMAND },
+        { IDC_KEEPALIVE,          IDS_DLG_KEEPALIVE        },
+        { IDC_KEEPALIVE_INTERVAL_LABEL, IDS_DLG_KEEPALIVE_INTERVAL },
         { IDC_PERMISSIONS_GROUP,  IDS_DLG_PERMISSIONS_GROUP },
         { IDC_FILEMOD_LABEL,      IDS_DLG_FILEMOD           },
         { IDC_DIRMOD_LABEL,       IDS_DLG_DIRMOD            },
@@ -2183,7 +2201,7 @@ INT_PTR ConnectionDialog::OnInitDialog(LPARAM /*lParam*/)
         { IDCANCEL,               IDS_BTN_CANCEL            },
     });
 
-    // Append version to dialog title: "Połącz z serwerem SFTP v1.0.0.x"
+    // Append the current plugin version to the dialog title.
     {
         const std::wstring ver = GetPluginVersionW();
         if (!ver.empty()) {
@@ -2334,6 +2352,12 @@ INT_PTR ConnectionDialog::OnInitDialog(LPARAM /*lParam*/)
         SendDlgItemMessage(m_hWnd, IDC_TRANSFERMODE, CB_SETCURSEL, 0, 0);
         fillProxyCombobox(m_hWnd, 0, dlgIniFileName);
     }
+    CheckDlgButton(m_hWnd, IDC_KEEPALIVE,
+                   m_settings->ssh_keepalive_enabled ? BST_CHECKED : BST_UNCHECKED);
+    SetDlgItemInt(m_hWnd, IDC_KEEPALIVE_INTERVAL,
+                  m_settings->ssh_keepalive_interval >= 5 && m_settings->ssh_keepalive_interval <= 3600
+                      ? m_settings->ssh_keepalive_interval : 30,
+                  FALSE);
     RebuildSystemAndEncodingCombos(m_hWnd, m_ctx, m_settings);
     SetLanTimeoutMinutes(m_hWnd, m_settings->lan_pair_timeout_min);
     m_ctx->lastTransferMode = (int)SendDlgItemMessage(m_hWnd, IDC_TRANSFERMODE, CB_GETCURSEL, 0, 0);
@@ -2444,6 +2468,10 @@ INT_PTR ConnectionDialog::OnCommand(WPARAM wParam, LPARAM /*lParam*/)
         break;
     case IDC_SCP_ALL:
         UpdateScpOnlyDependentControls(m_hWnd);
+        break;
+    case IDC_KEEPALIVE:
+        if (HIWORD(wParam) == BN_CLICKED)
+            UpdateKeepAliveControls(m_hWnd);
         break;
     }
     return 0;
@@ -2563,6 +2591,26 @@ void ConnectionDialog::OnOk()
     const bool shellTransferChecked = IsDlgButtonChecked(m_hWnd, IDC_SHELLTRANSFER) == BST_CHECKED;
     m_settings->shell_transfer_dd    = shellTransferChecked;
     m_settings->shell_transfer_force = shellTransferChecked;
+
+    // SSH keepalive is a plugin-wide option.  Store it in [Configuration]
+    // so it applies consistently to every SSH session.
+    m_settings->ssh_keepalive_enabled =
+        IsDlgButtonChecked(m_hWnd, IDC_KEEPALIVE) == BST_CHECKED;
+    BOOL keepaliveIntervalValid = FALSE;
+    UINT keepaliveInterval = GetDlgItemInt(m_hWnd, IDC_KEEPALIVE_INTERVAL,
+                                           &keepaliveIntervalValid, FALSE);
+    if (!keepaliveIntervalValid)
+        keepaliveInterval = 30;
+    keepaliveInterval = std::max<UINT>(5, std::min<UINT>(3600, keepaliveInterval));
+    m_settings->ssh_keepalive_interval = keepaliveInterval;
+    std::array<char, 16> keepaliveIntervalBuf{};
+    _itoa_s(static_cast<int>(keepaliveInterval), keepaliveIntervalBuf.data(),
+            keepaliveIntervalBuf.size(), 10);
+    WritePrivateProfileString("Configuration", "keepalive",
+                              m_settings->ssh_keepalive_enabled ? "1" : nullptr,
+                              dlgIniFileName);
+    WritePrivateProfileString("Configuration", "keepaliveinterval",
+                              keepaliveIntervalBuf.data(), dlgIniFileName);
 
     if (!phpMode || smbMode) {
         if (smbMode) {
@@ -3049,7 +3097,14 @@ pConnectSettings SftpConnectToServer(LPCSTR DisplayName, LPCSTR inifilename, LPC
 
             // Move the connected settings to the heap ? unique_ptrs transfer ownership.
             try {
-                return new tConnectSettings(std::move(ConnectSettings));
+                auto* heapSettings = new tConnectSettings(std::move(ConnectSettings));
+                heapSettings->ssh_keepalive_runtime = true;
+                if (heapSettings->session) {
+                    if (void** abstract = heapSettings->session->abstractPtr())
+                        *abstract = heapSettings;
+                }
+                StartSshKeepAlive(heapSettings);
+                return heapSettings;
             } catch (const std::bad_alloc&) {
                 if (ConnectSettings.feedback) {
                     ConnectSettings.feedback->ShowError(LngStrU8(IDS_ERR_OOM_CONN_SETTINGS, "Out of memory while creating connection settings."));

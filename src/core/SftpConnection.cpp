@@ -28,6 +28,8 @@
 #include <fstream>
 #include <iterator>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 #include "SessionImport.h"
 #include "PhpAgentClient.h"
 #include "PhpShellConsole.h"
@@ -57,6 +59,100 @@ static std::unique_ptr<ISshBackend> g_sshBackend;
 // Also the discovery service that announces this machine's presence.
 static std::unique_ptr<LanFileServer>    g_lanFileServer;
 static std::unique_ptr<lanpair::DiscoveryService> g_lanDiscovery;
+
+namespace {
+
+std::mutex g_keepAliveTimerMutex;
+std::unordered_map<UINT_PTR, pConnectSettings> g_keepAliveTimers;
+UINT_PTR g_nextKeepAliveTimerId = 0x53465000u;
+
+static HWND KeepAliveTimerWindow() noexcept
+{
+    // Total Commander owns the message loop that must dispatch WM_TIMER.
+    // SFTPplug connection calls can run on a worker thread, where a
+    // thread-owned SetTimer(nullptr, ...) has no message pump.
+    HWND hTcMain = FindWindowA("TTOTAL_CMD", nullptr);
+    if (hTcMain)
+        return hTcMain;
+    return GetForegroundWindow();
+}
+
+void CALLBACK SshKeepAliveTimerProc(HWND hWnd, UINT, UINT_PTR timerId, DWORD)
+{
+    pConnectSettings cs = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
+        const auto it = g_keepAliveTimers.find(timerId);
+        if (it != g_keepAliveTimers.end())
+            cs = it->second;
+    }
+
+    if (!cs || !cs->session || !cs->ssh_keepalive_runtime) {
+        KillTimer(hWnd, timerId);
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
+        g_keepAliveTimers.erase(timerId);
+        if (cs && cs->ssh_keepalive_timer == timerId)
+            cs->ssh_keepalive_timer = 0;
+        return;
+    }
+
+    int secondsToNext = 0;
+    const int rc = cs->session->keepaliveSend(&secondsToNext);
+    if (rc != 0 && rc != LIBSSH2_ERROR_EAGAIN)
+        CONN_LOG("SSH keepalive failed rc=%d", rc);
+}
+
+} // anonymous namespace
+
+bool StartSshKeepAlive(pConnectSettings cs)
+{
+    if (!cs || !cs->ssh_keepalive_runtime || !cs->ssh_keepalive_enabled ||
+        !cs->session || IsPhpAgentTransport(cs) || IsLanPairTransport(cs)) {
+        return false;
+    }
+
+    StopSshKeepAlive(cs);
+    const unsigned int interval = cs->ssh_keepalive_interval < 5
+        ? 5 : (cs->ssh_keepalive_interval > 3600 ? 3600 : cs->ssh_keepalive_interval);
+    cs->session->keepaliveConfig(1, interval);
+
+    ++g_nextKeepAliveTimerId;
+    if (g_nextKeepAliveTimerId == 0)
+        ++g_nextKeepAliveTimerId;
+    const UINT_PTR timerId = g_nextKeepAliveTimerId;
+    const HWND timerWindow = KeepAliveTimerWindow();
+    const UINT_PTR actualId = SetTimer(timerWindow, timerId, interval * 1000u, SshKeepAliveTimerProc);
+    if (actualId == 0) {
+        CONN_LOG("SSH keepalive timer creation failed error=%lu", GetLastError());
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
+        g_keepAliveTimers[actualId] = cs;
+    }
+    cs->ssh_keepalive_timer = actualId;
+    cs->ssh_keepalive_timer_thread = GetCurrentThreadId();
+    cs->ssh_keepalive_timer_window = timerWindow;
+    CONN_LOG("SSH keepalive enabled interval=%u sec timer=%llu",
+             interval, static_cast<unsigned long long>(actualId));
+    return true;
+}
+
+void StopSshKeepAlive(pConnectSettings cs)
+{
+    if (!cs || cs->ssh_keepalive_timer == 0)
+        return;
+    const UINT_PTR timerId = cs->ssh_keepalive_timer;
+    KillTimer(cs->ssh_keepalive_timer_window, timerId);
+    {
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
+        g_keepAliveTimers.erase(timerId);
+    }
+    cs->ssh_keepalive_timer = 0;
+    cs->ssh_keepalive_timer_thread = 0;
+    cs->ssh_keepalive_timer_window = nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Connection progress step percentages
@@ -259,6 +355,31 @@ bool WaitForTransportReadable(pConnectSettings cs)
     return IsSocketReadable(cs->sock);
 }
 
+bool WaitForSshIo(pConnectSettings cs, DWORD timeoutMs)
+{
+    if (!cs)
+        return false;
+    if (cs->transport_stream)
+        return cs->transport_stream->waitForSshIo(cs->session.get(), timeoutMs);
+    if (cs->sock == INVALID_SOCKET)
+        return false;
+
+    const int dirs = cs->session ? cs->session->blockDirections() : 0;
+    fd_set rfds, wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    if (dirs & LIBSSH2_SESSION_BLOCK_INBOUND)
+        FD_SET(cs->sock, &rfds);
+    if (dirs & LIBSSH2_SESSION_BLOCK_OUTBOUND)
+        FD_SET(cs->sock, &wfds);
+    if (!dirs)
+        FD_SET(cs->sock, &rfds);
+
+    timeval tv = { static_cast<long>(timeoutMs / 1000),
+                   static_cast<long>((timeoutMs % 1000) * 1000) };
+    return select(0, &rfds, &wfds, nullptr, &tv) > 0;
+}
+
 extern "C"
 int mysend(SOCKET s, LPCSTR buf, int len, int flags, LPCSTR progressmessage, int progressstart, int * ploop, SYSTICKS * plasttime)
 {
@@ -296,7 +417,7 @@ int myrecv(SOCKET s, LPSTR buf, int len, int flags, LPCSTR progressmessage, int 
         }
         if (ProgressLoop(progressmessage, progressstart, progressstart + 10, ploop, plasttime))
             break;   /* User aborted. */
-        Sleep(SOCKET_POLL_MS);
+        // IsSocketReadable() already performs the bounded readiness wait.
     }
     return ret;
 }
@@ -472,6 +593,10 @@ static int LanPairConnect(pConnectSettings cs)
 
 int SftpConnect(pConnectSettings ConnectSettings)
 {
+    // A reconnect replaces the libssh2 session.  Stop the old timer before
+    // touching session state; a fresh timer is started after a successful
+    // reconnect below.
+    StopSshKeepAlive(ConnectSettings);
     int hr = 0;
     if (IsLanPairTransport(ConnectSettings)) {
         return LanPairConnect(ConnectSettings);
@@ -559,6 +684,13 @@ int SftpConnect(pConnectSettings ConnectSettings)
         jump.useagent    = ConnectSettings->jump_useagent;
         jump.fingerprint = ConnectSettings->jump_fingerprint;
 
+        // ProxyJump creates its jump session before the normal target-session
+        // initialization path has a chance to lazily create the backend.
+        if (!g_sshBackend)
+            g_sshBackend = CreateSshBackend();
+        if (!g_sshBackend)
+            return fail(-60);
+
         // Target is the server configured in the profile (resolved already
         // in connecttoserver/connecttoport above).
         auto stream = ConnectViaJumpHost(
@@ -628,6 +760,8 @@ int SftpConnect(pConnectSettings ConnectSettings)
     if (ProgressProc(PluginNumber, buf.data(), "-", progress))
         return fail(SFTP_FAILED);
 
+    if (ConnectSettings->ssh_keepalive_runtime)
+        StartSshKeepAlive(ConnectSettings);
     CONN_LOG("SftpConnect success");
     return SFTP_OK;
 }
@@ -669,6 +803,7 @@ int SftpCloseConnection(pConnectSettings ConnectSettings)
 {
     int rc;
     if (ConnectSettings) {
+        StopSshKeepAlive(ConnectSettings);
         // LAN Pair: disconnect file session immediately.
         if (ConnectSettings->lanSession) {
             ConnectSettings->lanSession->disconnect();
@@ -709,7 +844,7 @@ int SftpCloseConnection(pConnectSettings ConnectSettings)
                 if (get_ticks_between(starttime) > DISCONNECT_TIMEOUT_MS)
                     break;
                 if (rc == LIBSSH2_ERROR_EAGAIN)
-                    WaitForTransportReadable(ConnectSettings);  // Sleep to avoid 100% CPU usage.
+                    WaitForSshIo(ConnectSettings);
             } while (rc == LIBSSH2_ERROR_EAGAIN);
             ConnectSettings->sftpsession.reset();
         }
@@ -723,7 +858,7 @@ int SftpCloseConnection(pConnectSettings ConnectSettings)
                 if (get_ticks_between(starttime) > DISCONNECT_TIMEOUT_MS)
                     break;
                 if (rc == LIBSSH2_ERROR_EAGAIN)
-                    WaitForTransportReadable(ConnectSettings);  // Sleep to avoid 100% CPU usage.
+                    WaitForSshIo(ConnectSettings);
             } while (rc == LIBSSH2_ERROR_EAGAIN);
             ConnectSettings->session->free();
             ConnectSettings->session.reset();
@@ -732,7 +867,6 @@ int SftpCloseConnection(pConnectSettings ConnectSettings)
         // the target session is freed above and BEFORE the jump socket closes.
         ConnectSettings->transport_stream.reset();
         if (ConnectSettings->sock != INVALID_SOCKET) {
-            Sleep(RECONNECT_SLEEP_MS);
             closesocket(ConnectSettings->sock);
             ConnectSettings->sock = INVALID_SOCKET;
         }
