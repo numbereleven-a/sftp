@@ -40,7 +40,8 @@ public:
         const std::string& localPeerId,
         const std::string& remotePeerId,
         const std::string& password,
-        lanpair::PairError*    err = nullptr) noexcept;
+        lanpair::PairError*    err = nullptr,
+        lanpair::PairRole      localRole = lanpair::PairRole::Dual) noexcept;
 
     bool isConnected() const noexcept;
     void disconnect()  noexcept;

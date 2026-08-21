@@ -469,6 +469,7 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
     std::unique_ptr<RemoteSftpFile> remoteSftp;
     std::unique_ptr<RemoteScpChannel> remoteScp;
     int64_t resumeOffset = 0;
+    bool truncateRestart = false;
 
     if (useScp) {
         if (cs->scponly) {
@@ -518,8 +519,27 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
                     if (!local.Seek(remoteSize))
                         return SFTP_READFAILED;
                     resumeOffset = remoteSize;
+                } else {
+                    // Remote file is LONGER than local: resuming in place would
+                    // leave a stale tail beyond the rewritten prefix. Restart
+                    // cleanly with truncation.
+                    truncateRestart = true;
                 }
+            } else {
+                // Remote size unknown — cannot resume safely, restart truncated.
+                truncateRestart = true;
             }
+        }
+
+        if (truncateRestart) {
+            remoteSftp.reset();
+            const unsigned long truncFlags =
+                LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC;
+            sftpHandle = OpenSftpFileWithRetry(cs, remotePath.c_str(), truncFlags, 0644);
+            if (!sftpHandle)
+                return SFTP_WRITEFAILED;
+            remoteSftp = std::make_unique<RemoteSftpFile>(std::move(sftpHandle));
+            resumeOffset = 0;
         }
     }
 

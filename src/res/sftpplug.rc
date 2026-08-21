@@ -1,4 +1,4 @@
-// Microsoft Visual C++ generated resource script.
+﻿// Microsoft Visual C++ generated resource script.
 //
 #include "resource.h"
 #include "..\\include\\version.h"
@@ -314,8 +314,8 @@ END
 //
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 10,1,0,0
- PRODUCTVERSION 10,1,0,0
+ FILEVERSION VER_FILEVERSION
+ PRODUCTVERSION VER_FILEVERSION
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -332,12 +332,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "kvc.pl"
             VALUE "FileDescription", "SFTP Plugin for Total Commander"
-            VALUE "FileVersion", "10.1.0.0"
+            VALUE "FileVersion", VER_FILEVERSION_STR
             VALUE "InternalName", "sftpplug"
             VALUE "LegalCopyright", "Copyright (C) 2026 kvc.pl"
             VALUE "OriginalFilename", "sftpplug.wfx"
             VALUE "ProductName", "SFTPplug"
-            VALUE "ProductVersion", "10.1.0.0"
+            VALUE "ProductVersion", VER_PRODUCTVERSION_STR
         END
     END
     BLOCK "VarFileInfo"

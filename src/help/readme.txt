@@ -1,4 +1,4 @@
-SFTP Plugin for Total Commander
+﻿SFTP Plugin for Total Commander v10.2
 Copyright (C) Marek Wesolowski
 
 Help:

@@ -1008,6 +1008,8 @@ static void HandleLanPairAction(HWND hWnd, ConnectDialogContext* dlgCtx, pConnec
     cfg.targetIp = it->second.ip;
     cfg.targetPort = it->second.tcpPort;
     cfg.password = WideToUtf8(passW.data());
+    cfg.role = (s->lan_pair_role == 1) ? lanpair::PairRole::Receiver :
+               (s->lan_pair_role == 2) ? lanpair::PairRole::Donor    : lanpair::PairRole::Dual;
 
     lanpair::PairSessionInfo info{};
     lanpair::PairError err{};

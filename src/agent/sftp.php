@@ -160,6 +160,9 @@ function op_list(): void
         if ($entry->isDot()) {
             continue;
         }
+        if ($entry->getFilename() === AGENT_REPLAY_DIR) {
+            continue; // internal replay-protection storage, not user data
+        }
         $count++;
         if ($count > AGENT_MAX_LIST_ITEMS) {
             fail(413, 'TOO_MANY_ITEMS', 'Directory item limit exceeded');
@@ -321,6 +324,9 @@ function tar_stream_dir(string $rootAbs, string $dirAbs, $out, string $relPath):
     while (($name = readdir($dh)) !== false) {
         if ($name === '.' || $name === '..') {
             continue;
+        }
+        if ($name === AGENT_REPLAY_DIR) {
+            continue; // internal replay-protection storage, not user data
         }
         $childAbs = $dirAbs . DIRECTORY_SEPARATOR . $name;
         $childRel = ($relPath === '') ? $name : $relPath . '/' . $name;
@@ -992,7 +998,6 @@ function require_auth(string $method, string $op): void
     if (!preg_match('/^[A-Za-z0-9._-]{8,128}$/', $nonce)) {
         fail(401, 'BAD_NONCE', 'Invalid nonce format');
     }
-    enforce_nonce_once($nonce, $ts);
 
     $base = strtoupper($method) . "\n" . $op . "\n" . $path . "\n" . $ts . "\n" . $nonce;
     if ($hmacPsk === '') {
@@ -1002,6 +1007,11 @@ function require_auth(string $method, string $op): void
     if (!hash_equals($expected, strtolower($sig))) {
         fail(401, 'BAD_SIGNATURE', 'Signature mismatch');
     }
+
+    // Register the nonce only AFTER the signature has been verified.
+    // Enforcing it earlier let an attacker burn a victim's future nonce
+    // with a garbage-signed request, causing a replay rejection (DoS).
+    enforce_nonce_once($nonce, $ts);
 }
 
 function resolve_agent_psk_plain(): string
@@ -1385,11 +1395,15 @@ function enforce_nonce_once(string $nonce, int $ts): void
 
     $key = hash('sha256', $nonce . '|' . $ts);
     $file = $base . DIRECTORY_SEPARATOR . $key . '.n';
-    if (file_exists($file)) {
+    // Atomic create: fopen('x') fails when the file already exists, so two
+    // concurrent requests with the same nonce can never both pass the check.
+    $fh = @fopen($file, 'x');
+    if ($fh === false) {
         fail(401, 'NONCE_REPLAY', 'Nonce already used');
     }
-    $ok = @file_put_contents($file, (string)$ts, LOCK_EX);
-    if ($ok === false) {
+    $ok = fwrite($fh, (string)$ts) !== false;
+    fclose($fh);
+    if (!$ok) {
         fail(500, 'NONCE_WRITE_FAILED', 'Failed to persist nonce');
     }
 }
