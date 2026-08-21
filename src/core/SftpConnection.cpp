@@ -571,10 +571,13 @@ static int LanPairConnect(pConnectSettings cs)
     }
 
     lanpair::PairError err;
+    const lanpair::PairRole localRole =
+        (cs->lan_pair_role == 1) ? lanpair::PairRole::Receiver :
+        (cs->lan_pair_role == 2) ? lanpair::PairRole::Donor    : lanpair::PairRole::Dual;
     auto session = LanPairSession::connect(
         foundIp, foundPort, localId, targetPeerId,
         cs->password,   // empty = use stored trust key
-        &err);
+        &err, localRole);
 
     if (!session) {
         std::string msg = LngStrU8(IDS_LAN_ERR_CONN_FAILED, "LAN Pair: connection failed");

@@ -24,7 +24,6 @@
 #include "PhpAgentClient.h"
 
 // Declared in SftpConnection.cpp
-void StartGlobalLanServices(bool startServer = true);
 void StopGlobalLanServices();
 
 HINSTANCE hinst = nullptr;
@@ -508,7 +507,10 @@ static int _FsInit(int PluginNr)
     DetectAndApplyLanguage(nullptr);
 
     InitMultiServer();
-    StartGlobalLanServices();  // Start LAN Pair file server + discovery in background
+    // LAN Pair services (file server + UDP discovery) are started lazily on
+    // first LAN Pair use (LanPairConnect / connection dialog), NOT on plugin
+    // load: the plugin must not listen on the network unless the user actually
+    // employs the LAN Pair transport.
     return 0;
 }
 

@@ -1,0 +1,7 @@
+[plugininstall]
+description=Secure FTP plugin (x64+x86) - static build, no external DLL required
+type=wfx
+file=SFTPplug.wfx
+file64=SFTPplug.wfx64
+defaultdir=SFTPplug
+version=10.2.0.0

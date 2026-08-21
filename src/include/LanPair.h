@@ -84,6 +84,7 @@ struct PairClientConfig {
     std::string peerId;
     std::string password;
     std::chrono::milliseconds timeout{8000};
+    PairRole role = PairRole::Dual;
 };
 
 struct PairSessionInfo {

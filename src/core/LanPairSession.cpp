@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // LanPairSession.cpp
 // File-transfer session layer on top of the PAIR1 auth protocol.
 // After PAIR1 the same TCP socket is kept open and a simple
@@ -197,7 +197,8 @@ AuthResult pair1Connect(
     const std::string& remotePeerId,
     const std::string& password,
     lanpair::PairError* err,
-    bool               forceNew = false) noexcept
+    bool               forceNew = false,
+    lanpair::PairRole  localRole = lanpair::PairRole::Dual) noexcept
 {
     AuthResult result;
 
@@ -239,7 +240,7 @@ AuthResult pair1Connect(
 
     std::ostringstream hello;
     hello << "PAIR1 HELLO " << localPeerId << " "
-          << roleToString(lanpair::PairRole::Donor) << " " << clientNonceHex;
+          << roleToString(localRole) << " " << clientNonceHex;
     if (!sendLine(s, hello.str())) {
         closesocket(s);
         if (err) { err->code = WSAGetLastError(); err->message = "Cannot send HELLO"; }
@@ -303,8 +304,9 @@ AuthResult pair1Connect(
                 auto derived = deriveKeyPbkdf2(password, std::span<const uint8_t>(salt.data(), salt.size()), kDerivedKeySize);
                 if (derived) {
                     key = *derived;
-                    std::string raw(reinterpret_cast<const char*>(key.data()), key.size());
-                    lanpair::DpapiSecretStore::saveSecret(trustKey, raw, nullptr);
+                    // NOTE: the password-derived key is NOT persisted here.
+                    // It is cached in DPAPI only after the server has verified
+                    // our proof, so a typo'd password never poisons the store.
                 }
             }
 
@@ -324,7 +326,14 @@ AuthResult pair1Connect(
             return sendLine(s, auth.str());
         }
 
-        return sendLine(s, "PAIR1 TRUSTNEW");
+        // SECURITY: bare TRUSTNEW is rejected by servers now (trust tokens
+        // require a password proof). Without a password there is no way to
+        // establish first-time trust, so fail fast with a clear reason.
+        if (err) {
+            err->code  = ERROR_ACCESS_DENIED;
+            err->message = "trust-password-required";
+        }
+        return false;
     };
 
     if (!sendAuthAndGetKey()) {
@@ -359,11 +368,11 @@ AuthResult pair1Connect(
             return result;
         }
         key.assign(trustBytes->begin(), trustBytes->end());
-        const std::string trustKey = trustKeyForClient(serverPeerId, localPeerId);
-        std::string raw(reinterpret_cast<const char*>(trustBytes->data()), trustBytes->size());
-        lanpair::DpapiSecretStore::saveSecret(trustKey, raw, nullptr);
     }
 
+    // Verify the server proof BEFORE persisting anything. Saving the trust
+    // secret first would let a failed/MITM'd handshake overwrite a working
+    // key with garbage and lock the peer out until manual re-pairing.
     auto expectedSrvProof = hmacSha256(key,
         std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(srvProofMaterial.data()),
@@ -373,6 +382,18 @@ AuthResult pair1Connect(
         closesocket(s);
         if (err) { err->code = ERROR_ACCESS_DENIED; err->message = "Server proof mismatch"; }
         return result;
+    }
+
+    if (ok[1] == "OKTRUST") {
+        const std::string trustKey = trustKeyForClient(serverPeerId, localPeerId);
+        std::string raw(reinterpret_cast<const char*>(key.data()), key.size());
+        lanpair::DpapiSecretStore::saveSecret(trustKey, raw, nullptr);
+    } else if (!password.empty()) {
+        // Password auth succeeded and the server verified our proof вЂ” now it is
+        // safe to cache the password-derived key for future passwordless connects.
+        const std::string trustKey = trustKeyForClient(serverPeerId, localPeerId);
+        std::string raw(reinterpret_cast<const char*>(key.data()), key.size());
+        lanpair::DpapiSecretStore::saveSecret(trustKey, raw, nullptr);
     }
 
     result.sock = s;
@@ -395,7 +416,7 @@ std::vector<std::string> lan2ReadResponse(SOCKET s) {
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
-// PrepareLanPairTrustKeys — public API, outside anonymous namespace
+// PrepareLanPairTrustKeys вЂ” public API, outside anonymous namespace
 // ---------------------------------------------------------------------------
 bool PrepareLanPairTrustKeys(const std::string& localPeerId,
                               const std::string& remotePeerId,
@@ -486,7 +507,8 @@ std::unique_ptr<LanPairSession> LanPairSession::connect(
     const std::string& localPeerId,
     const std::string& remotePeerId,
     const std::string& password,
-    lanpair::PairError* err) noexcept
+    lanpair::PairError* err,
+    lanpair::PairRole  localRole) noexcept
 {
     auto impl = std::make_unique<Impl>();
     if (!impl->wsa.ok()) {
@@ -497,7 +519,8 @@ std::unique_ptr<LanPairSession> LanPairSession::connect(
     SFTP_LOG("LAN2", "connect() -> pair1Connect %s:%u local=%s remote=%s",
              targetIp.c_str(), targetPort, localPeerId.c_str(), remotePeerId.c_str());
     AuthResult ar = pair1Connect(targetIp, targetPort,
-                                 localPeerId, remotePeerId, password, err);
+                                 localPeerId, remotePeerId, password, err,
+                                 false, localRole);
     if (ar.sock == INVALID_SOCKET) {
         const bool trustUnknown = err && err->message.find("trust-unknown") != std::string::npos;
         if (trustUnknown) {
@@ -509,7 +532,8 @@ std::unique_ptr<LanPairSession> LanPairSession::connect(
                 trustKeyForClient(remotePeerId, localPeerId), nullptr);
             lanpair::PairError retryErr;
             ar = pair1Connect(targetIp, targetPort,
-                              localPeerId, remotePeerId, password, &retryErr, true);
+                              localPeerId, remotePeerId, password, &retryErr,
+                              true, localRole);
             if (ar.sock != INVALID_SOCKET) {
                 if (err) { err->code = 0; err->message.clear(); }
             } else {
@@ -651,6 +675,10 @@ bool LanPairSession::getFile(const std::string& remotePath,
         std::strtoll(resp[1].c_str(), nullptr, 10));
 
     const DWORD createDisp = resume ? OPEN_ALWAYS : (overwrite ? CREATE_ALWAYS : CREATE_NEW);
+    // Remember whether the local file existed before we opened it, so a failed
+    // transfer never deletes pre-existing user data (e.g. a resumed download).
+    const bool existedBefore =
+        GetFileAttributesW(localPath) != INVALID_FILE_ATTRIBUTES;
     HANDLE hLocal = CreateFileW(localPath, GENERIC_WRITE, 0, nullptr,
                                 createDisp, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (hLocal == INVALID_HANDLE_VALUE) {
@@ -693,7 +721,10 @@ bool LanPairSession::getFile(const std::string& remotePath,
 
     if (!ok) {
         impl_->close();
-        DeleteFileW(localPath);
+        // Remove only the partial file we created ourselves; never delete
+        // a file that already existed before this transfer started.
+        if (!existedBefore)
+            DeleteFileW(localPath);
         return false;
     }
 
@@ -925,7 +956,36 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
             std::string raw(reinterpret_cast<const char*>(key.data()), key.size());
             lanpair::DpapiSecretStore::saveSecret(trustKey, raw, nullptr);
 
-        } else if (auth.size() == 2 && auth[0] == "PAIR1" && auth[1] == "TRUSTNEW") {
+        } else if (auth.size() == 3 && auth[0] == "PAIR1" && auth[1] == "TRUSTNEW") {
+            // SECURITY: a trust token is only issued to a peer that proves
+            // knowledge of the server password (HMAC of the same challenge
+            // material with the PBKDF2-derived key). A bare "PAIR1 TRUSTNEW"
+            // used to hand full filesystem access to ANY LAN host.
+            std::string pw;
+            {
+                std::lock_guard<std::mutex> lk(passwordMu_);
+                pw = password_;
+            }
+            if (pw.empty()) {
+                sendLine(s, "PAIR1 FAIL trust-required");
+                return false;
+            }
+
+            const auto pwKey = deriveKeyPbkdf2(
+                pw, derivePairSalt(serverPeerId_, clientPeerId), kDerivedKeySize);
+            bool proofOk = false;
+            if (pwKey) {
+                const auto expected = hmacSha256(*pwKey,
+                    std::span<const uint8_t>(
+                        reinterpret_cast<const uint8_t*>(material.data()), material.size()));
+                proofOk = expected &&
+                    hexEncode(expected->data(), expected->size()) == auth[2];
+            }
+            if (!proofOk) {
+                sendLine(s, "PAIR1 FAIL bad-auth");
+                return false;
+            }
+
             std::array<uint8_t, kDerivedKeySize> fresh{};
             if (!randomBytes(fresh.data(), fresh.size())) return false;
             key.assign(fresh.begin(), fresh.end());
@@ -988,7 +1048,7 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
         }
     }
 
-    // Safe path normalization — blocks path traversal.
+    // Safe path normalization вЂ” blocks path traversal.
     static std::string normPath(const std::string& p) {
         std::string res = p;
         std::replace(res.begin(), res.end(), '/', '\\');
@@ -1150,10 +1210,6 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
     }
 
     void handleClient(SOCKET client) {
-        if (trustedInstaller_.load(std::memory_order_relaxed)) {
-            AcquireTrustedInstallerToken();
-        }
-
         const BOOL keepAlive = TRUE;
         setsockopt(client, SOL_SOCKET, SO_KEEPALIVE,
                    reinterpret_cast<const char*>(&keepAlive), sizeof(keepAlive));
@@ -1163,6 +1219,12 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
         if (!authenticateClient(client, clientPeerId)) {
             closesocket(client);
             return;
+        }
+
+        // Impersonate only AFTER the peer has authenticated successfully;
+        // unauthenticated connections must never trigger TI token acquisition.
+        if (trustedInstaller_.load(std::memory_order_relaxed)) {
+            AcquireTrustedInstallerToken();
         }
 
         std::string helloLine;

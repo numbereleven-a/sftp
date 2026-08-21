@@ -6,6 +6,7 @@
 #include <vector>
 #include <stdint.h>
 #include <stdio.h>
+#include <atomic>
 #include <span>
 #include "SftpClient.h"
 #include "PluginEntryPoints.h"
@@ -145,8 +146,8 @@ static bool ShellExecPersistentProcessLines(
     cs->scpShellMsgBuf.clear();
     cs->scpShellErrBuf.clear();
 
-    static unsigned shellDdSeq = 1;
-    const unsigned seq = shellDdSeq++;
+    static std::atomic<unsigned> shellDdSeq{1};
+    const unsigned seq = shellDdSeq.fetch_add(1);
     std::array<char, 128> beginMarker{};
     std::array<char, 128> endMarker{};
     // Use per-command markers to safely parse output when a shared shell channel
@@ -770,6 +771,61 @@ static std::string BaseNameFromPath(const std::string& path)
     return normalized.substr(pos + 1);
 }
 
+// Stateful CRLF→LF converters used by the SCP sink upload so the size
+// declared in the "C" command header matches the bytes actually sent,
+// including CR/LF pairs split across read-buffer boundaries.
+static void CountCrLfToLf(const char* data, size_t len, bool& pendingCr, int64_t& total)
+{
+    size_t kept = 0;
+    size_t i = 0;
+    if (pendingCr) {
+        pendingCr = false;
+        ++kept;                       // lone CR from previous chunk…
+        if (len > 0 && data[0] == '\n') { i = 1; }  // …unless it pairs here
+    }
+    for (; i < len; ++i) {
+        if (data[i] == '\r' && i + 1 < len && data[i + 1] == '\n')
+            continue;                 // drop CR of an in-buffer CRLF
+        if (data[i] == '\r' && i + 1 == len) {
+            pendingCr = true;         // may pair with the next chunk
+            continue;
+        }
+        ++kept;
+    }
+    total += static_cast<int64_t>(kept);
+}
+
+// Converts one chunk with cross-chunk CRLF state. Separate in/out buffers,
+// so no in-place aliasing hazards; outCap must be >= len + 1 (worst case:
+// carried lone CR followed by a chunk with nothing dropped).
+static size_t CrLfToLfStateful(const char* in, size_t len, char* out, bool& pendingCr)
+{
+    size_t o = 0;
+    size_t i = 0;
+    if (pendingCr) {
+        pendingCr = false;
+        if (len > 0 && in[0] == '\n') {
+            out[o++] = '\n';           // complete the split CRLF: keep the LF
+            i = 1;
+        } else {
+            out[o++] = '\r';           // previous chunk ended with a lone CR
+        }
+    }
+    for (; i < len; ++i) {
+        const char ch = in[i];
+        if (ch == '\r') {
+            if (i + 1 < len) {
+                if (in[i + 1] == '\n') continue;   // drop CR of an in-buffer CRLF
+            } else {
+                pendingCr = true;                  // may pair with the next chunk
+                continue;
+            }
+        }
+        out[o++] = ch;
+    }
+    return o;
+}
+
 int ShellScpUploadFile(
     pConnectSettings cs,
     const std::string& remotePathArg,
@@ -789,8 +845,13 @@ int ShellScpUploadFile(
     if (!channel)
         return SFTP_FAILED;
 
-    std::string cmd = "scp -t ";
-    cmd += remotePathArg;
+    // scp -t runs through the remote login shell: without quoting, shell
+    // metacharacters coming from a remote directory listing would be
+    // interpreted (command injection).  Single-quote the whole argument;
+    // ShellQuoteSingle escapes embedded single quotes as '\''.
+    std::string cmd = "scp -t '";
+    cmd += string_util::ShellQuoteSingle(BuildScpPathArgument(remotePathArg));
+    cmd += "'";
     if (!SendChannelCommandNoEof(cs->session.get(), channel.get(), cmd.c_str(), cs->sock)) {
         DisconnectShell(channel.get());
         return SFTP_WRITEFAILED;
@@ -806,7 +867,28 @@ int ShellScpUploadFile(
 
     const std::string baseName = BaseNameFromPath(remotePathArg);
     std::array<char, 1024> header{};
-    _snprintf_s(header.data(), header.size(), _TRUNCATE, "C%04o %lld %s\n", cs->filemod & 0777, (long long)fileSize, baseName.c_str());
+
+    // The SCP sink protocol reads EXACTLY the byte count declared in the
+    // header. In text mode the wire size differs from the file size, so
+    // compute it precisely with a streaming pre-pass using the same
+    // conversion rules as the send loop (including chunk-boundary CRLF).
+    int64_t declaredSize = fileSize;
+    bool pendingCr = false;
+    if (textMode) {
+        LARGE_INTEGER pos0{};
+        pos0.QuadPart = 0;
+        SetFilePointerEx(localfile, pos0, nullptr, FILE_BEGIN);
+        int64_t convertedTotal = 0;
+        std::vector<char> preBuf(SFTP_SCP_BLOCK_SIZE * 2);
+        DWORD rd = 0;
+        while (ReadFile(localfile, preBuf.data(), (DWORD)preBuf.size(), &rd, nullptr) && rd > 0)
+            CountCrLfToLf(preBuf.data(), rd, pendingCr, convertedTotal);
+        SetFilePointerEx(localfile, pos0, nullptr, FILE_BEGIN);
+        pendingCr = false;
+        declaredSize = convertedTotal;
+    }
+
+    _snprintf_s(header.data(), header.size(), _TRUNCATE, "C%04o %lld %s\n", cs->filemod & 0777, (long long)declaredSize, baseName.c_str());
     if (!ScpWriteAll(channel.get(), cs, header.data(), strlen(header.data()), SFTP_SCP_WRITE_IDLE_TIMEOUT_MS) ||
         !ScpReadAck(channel.get(), cs, ackErr)) {
         if (!ackErr.empty())
@@ -816,13 +898,15 @@ int ShellScpUploadFile(
     }
 
     std::vector<char> dataBuf(textMode ? (SFTP_SCP_BLOCK_SIZE * 2) : (SFTP_MAX_WRITE_SIZE * 8));
+    std::vector<char> encBuf(textMode ? (SFTP_SCP_BLOCK_SIZE * 2 + 16) : 0);
     const SYSTICKS starttime = get_sys_ticks();
     DWORD len = 0;
     while (ReadFile(localfile, dataBuf.data(), (DWORD)dataBuf.size(), &len, nullptr) && len > 0) {
         size_t sendLen = len;
         if (textMode)
-            sendLen = (size_t)ConvertCrLfToLf(dataBuf.data(), len);
-        if (!ScpWriteAll(channel.get(), cs, dataBuf.data(), sendLen, SFTP_SCP_WRITE_IDLE_TIMEOUT_MS)) {
+            sendLen = CrLfToLfStateful(dataBuf.data(), len, encBuf.data(), pendingCr);
+        const char* sendBuf = textMode ? encBuf.data() : dataBuf.data();
+        if (!ScpWriteAll(channel.get(), cs, sendBuf, sendLen, SFTP_SCP_WRITE_IDLE_TIMEOUT_MS)) {
             DisconnectShell(channel.get());
             return SFTP_WRITEFAILED;
         }
@@ -830,6 +914,14 @@ int ShellScpUploadFile(
         if (UpdatePercentBar(cs, GetPercent(*outSizeLoaded, fileSize), localNameW, remoteNameW)) {
             DisconnectShell(channel.get());
             return SFTP_ABORT;
+        }
+    }
+    if (textMode && pendingCr) {
+        // A trailing lone CR at end of file.
+        const char cr = '\r';
+        if (!ScpWriteAll(channel.get(), cs, &cr, 1, SFTP_SCP_WRITE_IDLE_TIMEOUT_MS)) {
+            DisconnectShell(channel.get());
+            return SFTP_WRITEFAILED;
         }
     }
 

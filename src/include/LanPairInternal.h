@@ -123,24 +123,43 @@ inline std::optional<std::vector<uint8_t>> hmacSha256(
     std::span<const uint8_t> key,
     std::span<const uint8_t> data)
 {
+    // Cache the HMAC-SHA256 algorithm provider process-wide. Opening it on
+    // every call dominated PBKDF2 cost (120k iterations per key derivation).
+    // Inline-function statics are shared across TUs (single instance, C++17).
+    static BCRYPT_ALG_HANDLE cachedAlg   = nullptr;
+    static std::mutex      cachedAlgMu;
+
     BCRYPT_ALG_HANDLE  alg   = nullptr;
     BCRYPT_HASH_HANDLE hHash = nullptr;
     DWORD objLen = 0, cb = 0, hashLen = 0;
 
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr,
-                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
-        return std::nullopt;
+    {
+        std::lock_guard<std::mutex> lk(cachedAlgMu);
+        alg = cachedAlg;
+    }
+    if (!alg) {
+        BCRYPT_ALG_HANDLE fresh = nullptr;
+        if (BCryptOpenAlgorithmProvider(&fresh, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                        BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            return std::nullopt;
+        std::lock_guard<std::mutex> lk(cachedAlgMu);
+        if (!cachedAlg) {
+            cachedAlg = fresh;
+            alg       = fresh;
+        } else {
+            BCryptCloseAlgorithmProvider(fresh, 0);
+            alg = cachedAlg;
+        }
+    }
 
     if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
                           reinterpret_cast<PUCHAR>(&objLen), sizeof(objLen),
                           &cb, 0) != 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
         return std::nullopt;
     }
     if (BCryptGetProperty(alg, BCRYPT_HASH_LENGTH,
                           reinterpret_cast<PUCHAR>(&hashLen), sizeof(hashLen),
                           &cb, 0) != 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
         return std::nullopt;
     }
 
@@ -151,7 +170,6 @@ inline std::optional<std::vector<uint8_t>> hmacSha256(
                          hashObj.data(), objLen,
                          const_cast<PUCHAR>(key.data()),
                          static_cast<ULONG>(key.size()), 0) != 0) {
-        BCryptCloseAlgorithmProvider(alg, 0);
         return std::nullopt;
     }
 
@@ -161,7 +179,7 @@ inline std::optional<std::vector<uint8_t>> hmacSha256(
     const NTSTATUS h2 = BCryptFinishHash(hHash, out.data(),
                                          static_cast<ULONG>(out.size()), 0);
     BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(alg, 0);
+    // The algorithm provider stays cached — do NOT close it here.
 
     if (h1 != 0 || h2 != 0) return std::nullopt;
     return out;
@@ -180,10 +198,44 @@ inline std::optional<std::vector<uint8_t>> deriveKeyPbkdf2(
     constexpr size_t hLen = 32; // SHA-256 output size
     const size_t blockCount = (keyLen + hLen - 1) / hLen;
 
+    // Fast path: prime ONE keyed hash object with the password, then clone it
+    // per iteration via BCryptDuplicateHash instead of rebuilding the keyed
+    // HMAC state 120k times.
+    static BCRYPT_ALG_HANDLE cachedAlg = nullptr;
+    static std::mutex        cachedAlgMu;
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(cachedAlgMu);
+        alg = cachedAlg;
+    }
+    if (!alg) {
+        BCRYPT_ALG_HANDLE fresh = nullptr;
+        if (BCryptOpenAlgorithmProvider(&fresh, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                        BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            return std::nullopt;
+        std::lock_guard<std::mutex> lk(cachedAlgMu);
+        if (!cachedAlg) { cachedAlg = fresh; alg = fresh; }
+        else { BCryptCloseAlgorithmProvider(fresh, 0); alg = cachedAlg; }
+    }
+
+    DWORD objLen = 0, cb = 0;
+    if (BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
+                          reinterpret_cast<PUCHAR>(&objLen), sizeof(objLen),
+                          &cb, 0) != 0)
+        return std::nullopt;
+
+    BCRYPT_HASH_HANDLE hMaster = nullptr;
+    std::vector<uint8_t> masterObj(objLen);
+    if (BCryptCreateHash(alg, &hMaster, masterObj.data(), objLen,
+                         const_cast<PUCHAR>(passBytes.data()),
+                         static_cast<ULONG>(passBytes.size()), 0) != 0)
+        return std::nullopt;
+
     std::vector<uint8_t> derived;
     derived.reserve(blockCount * hLen);
+    bool ok = true;
 
-    for (size_t block = 1; block <= blockCount; ++block) {
+    for (size_t block = 1; block <= blockCount && ok; ++block) {
         // PRF input: salt || INT(block)  (RFC 2898 §5.2)
         std::vector<uint8_t> saltBlock(salt.begin(), salt.end());
         saltBlock.push_back(static_cast<uint8_t>((block >> 24) & 0xFF));
@@ -191,25 +243,62 @@ inline std::optional<std::vector<uint8_t>> deriveKeyPbkdf2(
         saltBlock.push_back(static_cast<uint8_t>((block >>  8) & 0xFF));
         saltBlock.push_back(static_cast<uint8_t>( block        & 0xFF));
 
-        auto u = hmacSha256(passBytes, saltBlock);
-        if (!u) return std::nullopt;
+        std::vector<uint8_t> t(hLen, 0);
+        std::vector<uint8_t> u(hLen, 0);
+        BCRYPT_HASH_HANDLE hIter = nullptr;
 
-        std::vector<uint8_t> t = *u;
-        for (ULONG i = 2; i <= kPbkdf2Iterations; ++i) {
-            u = hmacSha256(passBytes,
-                           std::span<const uint8_t>(u->data(), u->size()));
-            if (!u) return std::nullopt;
+        auto macOnce = [&](std::span<const uint8_t> in,
+                           std::vector<uint8_t>& outBuf) -> bool {
+            BCRYPT_HASH_HANDLE h = nullptr;
+            std::vector<uint8_t> obj(objLen);
+            if (BCryptDuplicateHash(hMaster, &h, obj.data(), objLen, 0) != 0)
+                return false;
+            const NTSTATUS r1 = BCryptHashData(h,
+                const_cast<PUCHAR>(in.data()), static_cast<ULONG>(in.size()), 0);
+            const NTSTATUS r2 = BCryptFinishHash(h, outBuf.data(),
+                                                 static_cast<ULONG>(outBuf.size()), 0);
+            BCryptDestroyHash(h);
+            return r1 == 0 && r2 == 0;
+        };
+
+        if (!macOnce(saltBlock, u)) { ok = false; break; }
+        t = u;
+        for (ULONG i = 2; i <= kPbkdf2Iterations && ok; ++i) {
+            std::span<const uint8_t> uIn(u.data(), u.size());
+            if (!macOnce(uIn, u)) { ok = false; break; }
             for (size_t j = 0; j < t.size(); ++j)
-                t[j] ^= (*u)[j];
+                t[j] ^= u[j];
         }
-        derived.insert(derived.end(), t.begin(), t.end());
+        if (ok)
+            derived.insert(derived.end(), t.begin(), t.end());
     }
+
+    BCryptDestroyHash(hMaster);
+    if (!ok) return std::nullopt;
 
     derived.resize(keyLen);
     return derived;
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic per-pair PBKDF2 salt: HMAC-SHA256("LANPAIR", "a<>b" sorted).
+inline std::vector<uint8_t> derivePairSalt(std::string_view peerIdA,
+                                           std::string_view peerIdB) {
+    std::string combined;
+    if (peerIdA < peerIdB) combined = std::string(peerIdA) + "<>" + std::string(peerIdB);
+    else                   combined = std::string(peerIdB) + "<>" + std::string(peerIdA);
+    std::vector<uint8_t> salt(16, 0);
+    auto h = hmacSha256(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("LANPAIR"), 7),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(combined.data()), combined.size()));
+    if (h && h->size() >= 16) {
+        for (size_t i = 0; i < 16; ++i) salt[i] = (*h)[i];
+    } else {
+        memcpy(salt.data(), "sftpplug-pair...", 16);
+    }
+    return salt;
+}
+
 // Key / token helpers
 // ---------------------------------------------------------------------------
 

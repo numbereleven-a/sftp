@@ -448,8 +448,29 @@ struct PairServer::Impl {
                     return false;
                 }
             } else {
-                if (auth.size() != 2 || auth[0] != "PAIR1" || auth[1] != "TRUSTNEW") {
+                // SECURITY: trust tokens are only issued to peers that prove
+                // knowledge of the configured password (HMAC over the same
+                // challenge material with the PBKDF2-derived key).
+                if (auth.size() != 3 || auth[0] != "PAIR1" || auth[1] != "TRUSTNEW") {
                     sendLine(s, "PAIR1 FAIL trust-required");
+                    return false;
+                }
+                if (cfg.password.empty()) {
+                    sendLine(s, "PAIR1 FAIL trust-required");
+                    return false;
+                }
+                const auto pwKey = deriveKeyPbkdf2(
+                    cfg.password, derivePairSalt(cfg.peerId, clientPeerId), kDerivedKeySize);
+                bool proofOk = false;
+                if (pwKey) {
+                    const auto expected = hmacSha256(*pwKey,
+                        std::span<const uint8_t>(
+                            reinterpret_cast<const uint8_t*>(material.data()), material.size()));
+                    proofOk = expected &&
+                        hexEncode(expected->data(), expected->size()) == auth[2];
+                }
+                if (!proofOk) {
+                    sendLine(s, "PAIR1 FAIL bad-auth");
                     return false;
                 }
                 std::array<uint8_t, kDerivedKeySize> fresh{};
@@ -616,7 +637,7 @@ bool PairClient::connectAndAuthenticate(const PairClientConfig& cfg,
 
     std::ostringstream hello;
     hello << "PAIR1 HELLO " << cfg.peerId << " "
-          << roleToString(PairRole::Donor) << " " << clientNonceHex;
+          << roleToString(cfg.role) << " " << clientNonceHex;
     if (!sendLine(s, hello.str())) {
         closesocket(s);
         setErr(err, WSAGetLastError(), "Cannot send hello");
@@ -713,11 +734,11 @@ bool PairClient::connectAndAuthenticate(const PairClientConfig& cfg,
                 return false;
             }
         } else {
-            if (!sendLine(s, "PAIR1 TRUSTNEW")) {
-                closesocket(s);
-                setErr(err, WSAGetLastError(), "Cannot send trust request");
-                return false;
-            }
+            // SECURITY: servers reject bare TRUSTNEW now. First-time pairing
+            // requires a shared password on both sides.
+            closesocket(s);
+            setErr(err, ERROR_ACCESS_DENIED, "Cannot pair: password required");
+            return false;
         }
     }
 
@@ -747,9 +768,6 @@ bool PairClient::connectAndAuthenticate(const PairClientConfig& cfg,
             return false;
         }
         key.assign(trustBytes->begin(), trustBytes->end());
-        const std::string trustKey = trustKeyForClient(serverPeerId, cfg.peerId);
-        std::string raw(reinterpret_cast<const char*>(trustBytes->data()), trustBytes->size());
-        DpapiSecretStore::saveSecret(trustKey, raw, nullptr);
     }
 
     const auto expectedServerProof = hmacSha256(key,
@@ -765,6 +783,14 @@ bool PairClient::connectAndAuthenticate(const PairClientConfig& cfg,
         closesocket(s);
         setErr(err, ERROR_ACCESS_DENIED, "Server proof mismatch");
         return false;
+    }
+
+    // Persist the trust secret only AFTER the server proof has been verified,
+    // so a failed handshake can never overwrite a working key with garbage.
+    if (ok[1] == "OKTRUST") {
+        const std::string trustKey = trustKeyForClient(serverPeerId, cfg.peerId);
+        std::string raw(reinterpret_cast<const char*>(key.data()), key.size());
+        DpapiSecretStore::saveSecret(trustKey, raw, nullptr);
     }
 
     if (outInfo) {
