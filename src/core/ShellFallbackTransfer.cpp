@@ -771,61 +771,6 @@ static std::string BaseNameFromPath(const std::string& path)
     return normalized.substr(pos + 1);
 }
 
-// Stateful CRLF→LF converters used by the SCP sink upload so the size
-// declared in the "C" command header matches the bytes actually sent,
-// including CR/LF pairs split across read-buffer boundaries.
-static void CountCrLfToLf(const char* data, size_t len, bool& pendingCr, int64_t& total)
-{
-    size_t kept = 0;
-    size_t i = 0;
-    if (pendingCr) {
-        pendingCr = false;
-        ++kept;                       // lone CR from previous chunk…
-        if (len > 0 && data[0] == '\n') { i = 1; }  // …unless it pairs here
-    }
-    for (; i < len; ++i) {
-        if (data[i] == '\r' && i + 1 < len && data[i + 1] == '\n')
-            continue;                 // drop CR of an in-buffer CRLF
-        if (data[i] == '\r' && i + 1 == len) {
-            pendingCr = true;         // may pair with the next chunk
-            continue;
-        }
-        ++kept;
-    }
-    total += static_cast<int64_t>(kept);
-}
-
-// Converts one chunk with cross-chunk CRLF state. Separate in/out buffers,
-// so no in-place aliasing hazards; outCap must be >= len + 1 (worst case:
-// carried lone CR followed by a chunk with nothing dropped).
-static size_t CrLfToLfStateful(const char* in, size_t len, char* out, bool& pendingCr)
-{
-    size_t o = 0;
-    size_t i = 0;
-    if (pendingCr) {
-        pendingCr = false;
-        if (len > 0 && in[0] == '\n') {
-            out[o++] = '\n';           // complete the split CRLF: keep the LF
-            i = 1;
-        } else {
-            out[o++] = '\r';           // previous chunk ended with a lone CR
-        }
-    }
-    for (; i < len; ++i) {
-        const char ch = in[i];
-        if (ch == '\r') {
-            if (i + 1 < len) {
-                if (in[i + 1] == '\n') continue;   // drop CR of an in-buffer CRLF
-            } else {
-                pendingCr = true;                  // may pair with the next chunk
-                continue;
-            }
-        }
-        out[o++] = ch;
-    }
-    return o;
-}
-
 int ShellScpUploadFile(
     pConnectSettings cs,
     const std::string& remotePathArg,
@@ -872,6 +817,8 @@ int ShellScpUploadFile(
     // header. In text mode the wire size differs from the file size, so
     // compute it precisely with a streaming pre-pass using the same
     // conversion rules as the send loop (including chunk-boundary CRLF).
+    // A lone CR at end of file is sent as one extra byte by the send loop,
+    // so it must be part of the declared size as well.
     int64_t declaredSize = fileSize;
     bool pendingCr = false;
     if (textMode) {
@@ -883,6 +830,8 @@ int ShellScpUploadFile(
         DWORD rd = 0;
         while (ReadFile(localfile, preBuf.data(), (DWORD)preBuf.size(), &rd, nullptr) && rd > 0)
             CountCrLfToLf(preBuf.data(), rd, pendingCr, convertedTotal);
+        if (pendingCr)
+            ++convertedTotal;         // trailing lone CR is written after the loop
         SetFilePointerEx(localfile, pos0, nullptr, FILE_BEGIN);
         pendingCr = false;
         declaredSize = convertedTotal;

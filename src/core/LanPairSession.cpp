@@ -313,6 +313,17 @@ AuthResult pair1Connect(
             if (key.empty() && lanpair::DpapiSecretStore::loadSecret(trustKey, &trustSecret, nullptr)) {
                 key.assign(trustSecret.begin(), trustSecret.end());
             }
+        } else if (!password.empty()) {
+            // forceNew: the server rejected our stored trust key (trust-unknown),
+            // so it cannot be reused. Prove knowledge of the shared password
+            // and request a FRESH trust token; the server answers OKTRUST with
+            // a new secret that replaces the stale one on both sides.
+            auto pairSalt = derivePairSalt(localPeerId, serverPeerId);
+            auto derived = deriveKeyPbkdf2(password,
+                std::span<const uint8_t>(pairSalt.data(), pairSalt.size()), kDerivedKeySize);
+            if (derived) {
+                key = *derived;
+            }
         }
 
         if (!key.empty()) {
@@ -322,7 +333,9 @@ AuthResult pair1Connect(
                     proofMaterial.size()));
             if (!proof) return false;
             std::ostringstream auth;
-            auth << "PAIR1 AUTH " << hexEncode(proof->data(), proof->size());
+            // TRUSTNEW asks the server to re-issue the trust token; AUTH reuses it.
+            auth << "PAIR1 " << (forceNew ? "TRUSTNEW" : "AUTH") << " "
+                 << hexEncode(proof->data(), proof->size());
             return sendLine(s, auth.str());
         }
 

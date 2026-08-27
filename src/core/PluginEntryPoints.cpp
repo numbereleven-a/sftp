@@ -578,6 +578,14 @@ void WINAPI FsStatusInfo(LPCSTR RemoteDir, int InfoStartEnd, int InfoOperation)
                  InfoStartEnd == FS_STATUS_START ? "START" : "END",
                  RemoteDir ? RemoteDir : "");
 
+        if (InfoOperation == FS_STATUS_OP_GET_MULTI ||
+            InfoOperation == FS_STATUS_OP_GET_MULTI_THREAD) {
+            if (InfoStartEnd == FS_STATUS_START)
+                BeginDownloadErrorBatch();
+            else
+                EndDownloadErrorBatch();
+        }
+
         if (strlen(RemoteDir) < 2)
             if (InfoOperation == FS_STATUS_OP_DELETE || InfoOperation == FS_STATUS_OP_RENMOV_MULTI)
                 disablereading = (InfoStartEnd == FS_STATUS_START) ? true : false;

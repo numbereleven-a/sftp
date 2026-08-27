@@ -17,6 +17,14 @@ if (!function_exists('str_ends_with')) {
         return $needle === '' || substr($haystack, -strlen($needle)) === $needle;
     }
 }
+// Some minimal PHP builds (e.g. Alpine CLI without php-ctype) ship without
+// ext/ctype even though the rest of the runtime is complete. require_auth()
+// relies on ctype_digit(), so provide an equivalent fallback.
+if (!function_exists('ctype_digit')) {
+    function ctype_digit(string $value): bool {
+        return $value !== '' && preg_match('/^[0-9]+\z/', $value) === 1;
+    }
+}
 
 /**
  * Single-file HTTP file agent for Total Commander plugin backend.
@@ -974,44 +982,54 @@ function require_auth(string $method, string $op): void
         fail(503, 'AGENT_NOT_CONFIGURED', 'PSK is not configured (set env var, AGENT_PSK, or AGENT_PSK_SHA256)');
     }
 
-    $legacyAuth = get_header('x-sftp-auth', '');
-    if ($legacyAuth !== '' && verify_legacy_auth($legacyAuth)) {
-        return;
-    }
-
-    $path = normalize_rel((string)get_param('path', ''));
     $tsRaw = get_header('x-sftp-ts', '');
     $nonce = get_header('x-sftp-nonce', '');
     $sig = get_header('x-sftp-signature', '');
 
-    if ($tsRaw === '' || $nonce === '' || $sig === '') {
-        fail(401, 'AUTH_REQUIRED', 'Missing auth headers');
+    // Presence of any HMAC header selects HMAC auth mode. Current clients send
+    // HMAC headers together with the legacy bearer header for compatibility,
+    // so when HMAC mode is selected the signature is ALWAYS verified and the
+    // legacy header no longer short-circuits the check. Legacy-only clients
+    // (no HMAC headers at all) fall through to bearer auth below.
+    if ($sig !== '' || $tsRaw !== '' || $nonce !== '') {
+        if ($tsRaw === '' || $nonce === '' || $sig === '') {
+            fail(401, 'AUTH_REQUIRED', 'Missing auth headers');
+        }
+
+        if (!ctype_digit($tsRaw)) {
+            fail(401, 'BAD_TIMESTAMP', 'Invalid timestamp');
+        }
+        $ts = (int)$tsRaw;
+        if (abs(time() - $ts) > AGENT_NONCE_TTL) {
+            fail(401, 'TIMESTAMP_EXPIRED', 'Timestamp outside allowed window');
+        }
+        if (!preg_match('/^[A-Za-z0-9._-]{8,128}$/', $nonce)) {
+            fail(401, 'BAD_NONCE', 'Invalid nonce format');
+        }
+        if ($hmacPsk === '') {
+            fail(401, 'AUTH_REQUIRED', 'HMAC auth requires plain PSK');
+        }
+
+        $path = normalize_rel((string)get_param('path', ''));
+        $base = strtoupper($method) . "\n" . $op . "\n" . $path . "\n" . $ts . "\n" . $nonce;
+        $expected = hash_hmac('sha256', $base, $hmacPsk);
+        if (!hash_equals($expected, strtolower($sig))) {
+            fail(401, 'BAD_SIGNATURE', 'Signature mismatch');
+        }
+
+        // Register the nonce only AFTER the signature has been verified.
+        // Enforcing it earlier let an attacker burn a victim's future nonce
+        // with a garbage-signed request, causing a replay rejection (DoS).
+        enforce_nonce_once($nonce, $ts);
+        return;
     }
 
-    if (!ctype_digit($tsRaw)) {
-        fail(401, 'BAD_TIMESTAMP', 'Invalid timestamp');
+    // Legacy bearer mode: older clients that only understand X-SFTP-AUTH.
+    $legacyAuth = get_header('x-sftp-auth', '');
+    if ($legacyAuth !== '' && verify_legacy_auth($legacyAuth)) {
+        return;
     }
-    $ts = (int)$tsRaw;
-    if (abs(time() - $ts) > AGENT_NONCE_TTL) {
-        fail(401, 'TIMESTAMP_EXPIRED', 'Timestamp outside allowed window');
-    }
-    if (!preg_match('/^[A-Za-z0-9._-]{8,128}$/', $nonce)) {
-        fail(401, 'BAD_NONCE', 'Invalid nonce format');
-    }
-
-    $base = strtoupper($method) . "\n" . $op . "\n" . $path . "\n" . $ts . "\n" . $nonce;
-    if ($hmacPsk === '') {
-        fail(401, 'AUTH_REQUIRED', 'HMAC auth requires plain PSK');
-    }
-    $expected = hash_hmac('sha256', $base, $hmacPsk);
-    if (!hash_equals($expected, strtolower($sig))) {
-        fail(401, 'BAD_SIGNATURE', 'Signature mismatch');
-    }
-
-    // Register the nonce only AFTER the signature has been verified.
-    // Enforcing it earlier let an attacker burn a victim's future nonce
-    // with a garbage-signed request, causing a replay rejection (DoS).
-    enforce_nonce_once($nonce, $ts);
+    fail(401, 'AUTH_REQUIRED', 'Missing auth headers');
 }
 
 function resolve_agent_psk_plain(): string
@@ -1463,6 +1481,10 @@ function collect_capabilities(array $ini): array
             'zlib' => extension_loaded('zlib'),
             'zstd' => extension_loaded('zstd'),
             'brotli' => extension_loaded('brotli'),
+            // Core dependencies of the HMAC auth path; a false value means the
+            // agent relies on the built-in polyfills (or must be fixed).
+            'ctype' => function_exists('ctype_digit') && extension_loaded('ctype'),
+            'hash' => function_exists('hash_hmac'),
         ],
         'compression' => $compression,
         'hash_algorithms' => $preferredHashes,

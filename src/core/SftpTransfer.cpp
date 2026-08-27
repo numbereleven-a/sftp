@@ -437,29 +437,36 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
     if (useScp && !PrepareScpTransferSession(cs))
         return SFTP_FAILED;
 
-    // For text mode, adjust filesize (approximate)
+    // For text mode, compute the exact wire size with the same stateful
+    // conversion the send loop uses: CRLF pairs collapse to LF and a trailing
+    // lone CR stays, so "filesize - CR count" is only an approximation.
+    // NUL bytes still switch the transfer to binary mode.
     int64_t uploadSize = filesize;
     if (textMode) {
-        // Simple heuristic: count CRs
-        std::array<char, SFTP_SCP_BLOCK_SIZE> buf{};
-        DWORD read;
-        int64_t crCount = 0;
         if (SetFilePointer(local.get(), 0, nullptr, FILE_BEGIN) != INVALID_SET_FILE_POINTER) {
+            bool pendingCr = false;
+            int64_t convertedTotal = 0;
+            bool binary = false;
+            std::array<char, SFTP_SCP_BLOCK_SIZE> buf{};
+            DWORD read = 0;
             while (ReadFile(local.get(), buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr) && read > 0) {
                 for (DWORD i = 0; i < read; ++i) {
-                    if (buf[i] == '\r')
-                        ++crCount;
-                    else if (buf[i] == 0) {
-                        textMode = false; // binary detected
-                        crCount = 0;
+                    if (buf[i] == 0) {
+                        binary = true;
                         break;
                     }
                 }
-                if (!textMode) break;
+                if (binary) break;
+                CountCrLfToLf(buf.data(), read, pendingCr, convertedTotal);
+            }
+            if (binary) {
+                textMode = false;
+            } else {
+                if (pendingCr)
+                    ++convertedTotal;   // trailing lone CR is written after the loop
+                uploadSize = convertedTotal;
             }
         }
-        if (textMode)
-            uploadSize = filesize - crCount;
         SetFilePointer(local.get(), 0, nullptr, FILE_BEGIN);
     }
 
@@ -500,7 +507,12 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
             return SFTP_WRITEFAILED;
         remoteSftp = std::make_unique<RemoteSftpFile>(std::move(sftpHandle));
 
-        if (Resume) {
+        if (Resume && textMode) {
+            // In text mode local and remote byte offsets are not 1:1 (CRLF
+            // pairs collapse to LF), so resuming at a raw offset would shift
+            // the content. Restart cleanly with truncation instead.
+            truncateRestart = true;
+        } else if (Resume) {
             // Get remote size and seek
             LIBSSH2_SFTP_ATTRIBUTES attr{};
             // Request both permissions AND size from server
@@ -545,28 +557,20 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
 
     // Upload loop
     std::vector<char> buffer(SFTP_MAX_WRITE_SIZE * 32);
+    std::vector<char> convBuf(textMode ? buffer.size() + 16 : 0);
+    bool pendingCr = false;
     int64_t sent = resumeOffset; // start from resume offset so progress bar is correct
     auto lastProgress = std::chrono::steady_clock::now();
     int ret = SFTP_OK;
 
-    while (true) {
-        DWORD read = 0;
-        if (!ReadFile(local.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) || read == 0)
-            break;
-
-        int dataLen = static_cast<int>(read);
-        char* data = buffer.data();
-        if (textMode)
-            dataLen = ConvertCrLfToLf(data, read);
-
-        size_t toWrite = static_cast<size_t>(dataLen);
+    auto writeAll = [&](const char* data, size_t len) -> bool {
         size_t written = 0;
-        while (written < toWrite) {
+        while (written < len) {
             int w = 0;
             if (useScp)
-                w = static_cast<int>(remoteScp->get()->write(data + written, toWrite - written));
+                w = static_cast<int>(remoteScp->get()->write(data + written, len - written));
             else
-                w = static_cast<int>(remoteSftp->get()->write(data + written, toWrite - written));
+                w = static_cast<int>(remoteSftp->get()->write(data + written, len - written));
 
             if (w > 0) {
                 written += w;
@@ -577,16 +581,35 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastProgress).count();
                     if (elapsed > SFTP_SCP_WRITE_IDLE_TIMEOUT_MS) {
                         ShowStatusId(IDS_LOG_SCP_UL_TIMEOUT, nullptr, true);
-                        ret = SFTP_WRITEFAILED;
-                        break;
+                        return false;
                     }
                 }
                 IsSocketWritable(cs->sock);
             } else {
                 SftpLogLastError("Upload write error: ", w);
-                ret = SFTP_WRITEFAILED;
-                break;
+                return false;
             }
+        }
+        return true;
+    };
+
+    while (true) {
+        DWORD read = 0;
+        if (!ReadFile(local.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) || read == 0)
+            break;
+
+        size_t dataLen = read;
+        const char* data = buffer.data();
+        if (textMode) {
+            // Stateful conversion: CR/LF pairs split across read-buffer
+            // boundaries are still collapsed correctly.
+            dataLen = CrLfToLfStateful(buffer.data(), read, convBuf.data(), pendingCr);
+            data = convBuf.data();
+        }
+
+        if (!writeAll(data, dataLen)) {
+            ret = SFTP_WRITEFAILED;
+            break;
         }
 
         sent += read; // count original bytes for progress
@@ -594,7 +617,13 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
             ret = SFTP_ABORT;
             break;
         }
-        if (ret != SFTP_OK) break;
+    }
+
+    if (ret == SFTP_OK && textMode && pendingCr) {
+        // A trailing lone CR at end of file (matches the pre-pass size).
+        const char cr = '\r';
+        if (!writeAll(&cr, 1))
+            ret = SFTP_WRITEFAILED;
     }
 
     // Finalize the remote file before reporting upload completion. Destroying
