@@ -563,13 +563,28 @@
 #define IDS_IMP_BROWSE_KITTY_FOLDER     12102
 #define IDS_LAN_ERR_DONOR_NO_CONNECT    12103
 
+// ---------------------------------------------------------------------------
+// Batch download error dialog
+// ---------------------------------------------------------------------------
+#define IDD_DOWNLOAD_ERROR              118
+#define IDC_DOWNLOAD_ERROR_PATH         1109
+#define IDC_DOWNLOAD_SKIP               1110
+#define IDC_DOWNLOAD_SKIP_ALL           1111
+#define IDC_DOWNLOAD_ERROR_TEXT         1112
+#define IDS_DOWNLOAD_ERROR_TITLE        12104
+#define IDS_DOWNLOAD_ERROR_TEXT         12105
+#define IDS_DOWNLOAD_SKIP               12106
+#define IDS_DOWNLOAD_SKIP_ALL           12107
+#define IDS_CANCEL                      12108
+#define IDS_LOG_DOWNLOAD_SKIPPED        12109
+
 // Next default values for new objects
 //
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
-#define _APS_NEXT_RESOURCE_VALUE        201
+#define _APS_NEXT_RESOURCE_VALUE        202
 #define _APS_NEXT_COMMAND_VALUE         40001
-#define _APS_NEXT_CONTROL_VALUE         1056
+#define _APS_NEXT_CONTROL_VALUE         1113
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif

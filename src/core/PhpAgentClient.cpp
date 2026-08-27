@@ -319,11 +319,21 @@ static std::wstring PhpAgentAuthHeaders(pConnectSettings cs,
                 snprintf(&sigHex[i * 2], 3, "%02x", (*mac)[i]);
         }
 
-        h += L"\r\nX-SFTP-TS: "      + unicode_util::utf8_to_wstring(tsBuf);
-        h += L"\r\nX-SFTP-NONCE: "   + unicode_util::utf8_to_wstring(nonceHex);
-        h += L"\r\nX-SFTP-SIGNATURE: " + unicode_util::utf8_to_wstring(sigHex);
-        // Legacy bearer header: older sftp.php deployments authenticate with it.
-        h += L"\r\nX-SFTP-AUTH: "    + unicode_util::utf8_to_wstring(cs->password);
+        if (!sigHex.empty()) {
+            h += L"\r\nX-SFTP-TS: "      + unicode_util::utf8_to_wstring(tsBuf);
+            h += L"\r\nX-SFTP-NONCE: "   + unicode_util::utf8_to_wstring(nonceHex);
+            h += L"\r\nX-SFTP-SIGNATURE: " + unicode_util::utf8_to_wstring(sigHex);
+            // Legacy bearer header is only sent to older agents that do not
+            // understand HMAC signing (see PROBE auth.hmac_auth). Sending the
+            // raw PSK to a HMAC-capable agent would let it be accepted without
+            // the signature check, so it is omitted there.
+            if (!cs->php_agent_hmac)
+                h += L"\r\nX-SFTP-AUTH: "    + unicode_util::utf8_to_wstring(cs->password);
+        } else {
+            // HMAC computation unavailable (BCrypt failure): fall back to
+            // bearer-only so legacy agents still accept the request.
+            h += L"\r\nX-SFTP-AUTH: "    + unicode_util::utf8_to_wstring(cs->password);
+        }
     }
     h += L"\r\n";
     return h;
@@ -825,6 +835,7 @@ int PhpAgentProbe(pConnectSettings cs)
         return rc;
     if (cs) {
         cs->php_recommended_chunk_mib = 0;
+        cs->php_agent_hmac = false;
         int recBytes = 0;
         if (ExtractJsonIntField(body, "recommended_chunk_size", &recBytes) && recBytes > 0) {
             int recMiB = recBytes / (1024 * 1024);
@@ -833,6 +844,11 @@ int PhpAgentProbe(pConnectSettings cs)
             recMiB = std::clamp(recMiB, 1, 64);
             cs->php_recommended_chunk_mib = recMiB;
             PHP_LOG("Probe recommended chunk parsed=%d MiB", recMiB);
+        }
+        bool hmacAuth = false;
+        if (ExtractJsonBoolField(body, "hmac_auth", &hmacAuth)) {
+            cs->php_agent_hmac = hmacAuth;
+            PHP_LOG("Probe hmac_auth=%d", hmacAuth ? 1 : 0);
         }
     }
     PHP_LOG("Probe done status=%lu body_len=%u", (unsigned long)code, (unsigned)body.size());

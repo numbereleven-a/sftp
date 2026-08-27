@@ -1,5 +1,25 @@
 # Release Notes
 
+## SFTPplug 10.2.1.1
+
+### New
+
+- Signed PHP Agent requests with HMAC-SHA256 (`X-SFTP-TS`, `X-SFTP-NONCE`, and `X-SFTP-SIGNATURE`), while retaining legacy mode for older agents.
+- Hardened LAN Pair trust with trust tokens, PBKDF2 key derivation, and DPAPI-protected storage.
+- Added PHP Agent capabilities to the PROBE response (`hmac_auth`, `hash`, and `ctype`).
+- Added `Skip`, `Skip all`, and `Cancel` choices when a file fails during a multi-file download. `Skip all` applies only to the current batch, removes incomplete local files, and resets automatically when the operation ends.
+
+### Fixed
+
+- Fixed a mismatch between the reported and actual size when SCP fallback data ended with a trailing CR.
+- Fixed CRLF pairs split across chunk boundaries during native SFTP uploads.
+- Fixed the legacy trust-token recovery path (`TRUSTNEW`).
+- Fixed legacy headers bypassing signature verification.
+- Fixed PHP Agent HTTP 500 errors when the ctype extension was unavailable.
+- Fixed nonce registration occurring before signature verification, preventing replay-cache exhaustion by invalid requests.
+
+---
+
 ## SFTPplug 10.1.0.0
 
 - Fixed Pageant identity enumeration so available agent keys are no longer skipped during authentication.

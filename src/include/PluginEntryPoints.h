@@ -34,4 +34,9 @@ bool UpdatePercentBar(pConnectSettings ConnectSettings, int percent, LPCWSTR sou
 void ApplyConfiguredUiLanguageForCurrentThread() noexcept;
 LANGID GetConfiguredUiLanguageId() noexcept;
 
+// The skip-all choice is scoped to the current Total Commander multi-file
+// download callback sequence and stored independently for each transfer thread.
+void BeginDownloadErrorBatch() noexcept;
+void EndDownloadErrorBatch() noexcept;
+
 

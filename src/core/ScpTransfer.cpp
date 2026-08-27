@@ -189,6 +189,62 @@ int ConvertCrLfToLf(LPSTR data, size_t len)
     return static_cast<int>(out);
 }
 
+// Counts the CRLF->LF output size of a chunk, carrying a pending lone CR
+// from the previous chunk (see CrLfToLfStateful). total accumulates the kept
+// byte count; a still-pending CR at the end is NOT included here, so callers
+// must add 1 if pendingCr is true after the final chunk.
+void CountCrLfToLf(const char* data, size_t len, bool& pendingCr, int64_t& total)
+{
+    size_t kept = 0;
+    size_t i = 0;
+    if (pendingCr) {
+        pendingCr = false;
+        ++kept;                       // lone CR from previous chunk…
+        if (len > 0 && data[0] == '\n') { i = 1; }  // …unless it pairs here
+    }
+    for (; i < len; ++i) {
+        if (data[i] == '\r' && i + 1 < len && data[i + 1] == '\n')
+            continue;                 // drop CR of an in-buffer CRLF
+        if (data[i] == '\r' && i + 1 == len) {
+            pendingCr = true;         // may pair with the next chunk
+            continue;
+        }
+        ++kept;
+    }
+    total += static_cast<int64_t>(kept);
+}
+
+// Converts one chunk with cross-chunk CRLF state. Separate in/out buffers,
+// so no in-place aliasing hazards; outCap must be >= len + 1 (worst case:
+// carried lone CR followed by a chunk with nothing dropped).
+size_t CrLfToLfStateful(const char* in, size_t len, char* out, bool& pendingCr)
+{
+    size_t o = 0;
+    size_t i = 0;
+    if (pendingCr) {
+        pendingCr = false;
+        if (len > 0 && in[0] == '\n') {
+            out[o++] = '\n';           // complete the split CRLF: keep the LF
+            i = 1;
+        } else {
+            out[o++] = '\r';           // previous chunk ended with a lone CR
+        }
+    }
+    for (; i < len; ++i) {
+        const char ch = in[i];
+        if (ch == '\r') {
+            if (i + 1 < len) {
+                if (in[i + 1] == '\n') continue;   // drop CR of an in-buffer CRLF
+            } else {
+                pendingCr = true;                  // may pair with the next chunk
+                continue;
+            }
+        }
+        out[o++] = ch;
+    }
+    return o;
+}
+
 void ShowTransferSpeedIfLarge(LPCSTR prefix, int64_t bytesTransferred, SYSTICKS starttime)
 {
     if (bytesTransferred < SFTP_SPEED_STATS_MIN_BYTES)

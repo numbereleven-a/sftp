@@ -448,37 +448,14 @@ struct PairServer::Impl {
                     return false;
                 }
             } else {
-                // SECURITY: trust tokens are only issued to peers that prove
-                // knowledge of the configured password (HMAC over the same
-                // challenge material with the PBKDF2-derived key).
-                if (auth.size() != 3 || auth[0] != "PAIR1" || auth[1] != "TRUSTNEW") {
-                    sendLine(s, "PAIR1 FAIL trust-required");
-                    return false;
-                }
-                if (cfg.password.empty()) {
-                    sendLine(s, "PAIR1 FAIL trust-required");
-                    return false;
-                }
-                const auto pwKey = deriveKeyPbkdf2(
-                    cfg.password, derivePairSalt(cfg.peerId, clientPeerId), kDerivedKeySize);
-                bool proofOk = false;
-                if (pwKey) {
-                    const auto expected = hmacSha256(*pwKey,
-                        std::span<const uint8_t>(
-                            reinterpret_cast<const uint8_t*>(material.data()), material.size()));
-                    proofOk = expected &&
-                        hexEncode(expected->data(), expected->size()) == auth[2];
-                }
-                if (!proofOk) {
-                    sendLine(s, "PAIR1 FAIL bad-auth");
-                    return false;
-                }
-                std::array<uint8_t, kDerivedKeySize> fresh{};
-                if (!randomBytes(fresh.data(), fresh.size())) return false;
-                key.assign(fresh.begin(), fresh.end());
-                issuedTrustHex = hexEncode(fresh.data(), fresh.size());
-                std::string secret(reinterpret_cast<const char*>(fresh.data()), fresh.size());
-                DpapiSecretStore::saveSecret(trustKey, secret, nullptr);
+                // SECURITY: first-time pairing without a shared password is
+                // not possible — trust tokens are only issued to a peer that
+                // proves knowledge of the configured password. A bare
+                // "PAIR1 TRUSTNEW" used to hand full filesystem access to ANY
+                // LAN host, so without a password there is nothing to derive
+                // a key from and the request is rejected with a clear reason.
+                sendLine(s, "PAIR1 FAIL trust-required");
+                return false;
             }
         }
 
