@@ -703,7 +703,12 @@ bool LanPairSession::getFile(const std::string& remotePath,
 
     if (resume && offset > 0) {
         LARGE_INTEGER li{}; li.QuadPart = offset;
-        SetFilePointerEx(hLocal, li, nullptr, FILE_END);
+        if (!SetFilePointerEx(hLocal, li, nullptr, FILE_BEGIN)) {
+            CloseHandle(hLocal);
+            impl_->close();
+            if (fsResult) *fsResult = FS_FILE_WRITEERROR;
+            return false;
+        }
     }
 
     constexpr size_t kChunk = 65536;
@@ -807,7 +812,9 @@ bool LanPairSession::putFile(LPCWSTR            localPath,
     if (!ok) { impl_->close(); return false; }
 
     std::string doneResp;
-    if (!recvLine(impl_->sock_, &doneResp) || splitBySpace(doneResp)[0] != "DONE") {
+    const bool receivedDone = recvLine(impl_->sock_, &doneResp);
+    const auto doneFields = splitBySpace(doneResp);
+    if (!receivedDone || doneFields.empty() || doneFields[0] != "DONE") {
         impl_->close();
         if (fsResult) *fsResult = FS_FILE_WRITEERROR;
         return false;

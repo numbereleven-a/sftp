@@ -1,5 +1,13 @@
 # Release Notes
 
+## SFTPplug 10.2.1.2
+
+- Fixed corrupted LAN Pair downloads when resuming an existing partial file. Remaining data is now written at the requested absolute offset.
+- Fixed a crash when a LAN Pair upload received an empty completion response. The transfer now reports a write error and closes the connection.
+- Fixed Skip all returning a write error when the local destination directory did not exist and there was no partial file to remove.
+
+---
+
 ## SFTPplug 10.2.1.1
 
 ### New

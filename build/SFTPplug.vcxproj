@@ -167,6 +167,7 @@
     <ClCompile Include="..\src\core\PluginEntryPoints.cpp" />
     <ClCompile Include="..\src\core\PluginEntryPointsFind.cpp" />
     <ClCompile Include="..\src\core\PluginEntryPointsFile.cpp" />
+    <ClCompile Include="..\src\core\DownloadErrors.cpp" />
     <ClCompile Include="..\src\core\LngLoader.cpp" />
     <ClCompile Include="..\src\core\DllExceptionBarrier.cpp" />
     <ClCompile Include="..\src\core\CoreUtils.cpp" />
