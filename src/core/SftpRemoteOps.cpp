@@ -734,9 +734,9 @@ int SftpSetAttr(pConnectSettings cs, LPCSTR RemoteName, int NewAttr)
     return (rc == 0) ? SFTP_OK : SFTP_FAILED;
 }
 
-int SftpSetDateTimeW(pConnectSettings cs, LPCWSTR RemoteName, LPFILETIME LastWriteTime)
+int SftpSetDateTimeW(pConnectSettings cs, LPCWSTR RemoteName, LPFILETIME LastWriteTime, LPFILETIME LastAccessTime)
 {
-    if (!cs || !RemoteName || !LastWriteTime || cs->scponly || IsPhpAgentTransport(cs))
+    if (!cs || !RemoteName || (!LastWriteTime && !LastAccessTime) || cs->scponly || IsPhpAgentTransport(cs))
         return SFTP_FAILED;
 
     std::string nameA(wdirtypemax, '\0');
@@ -745,8 +745,15 @@ int SftpSetDateTimeW(pConnectSettings cs, LPCWSTR RemoteName, LPFILETIME LastWri
 
     LIBSSH2_SFTP_ATTRIBUTES attr{};
     attr.flags = LIBSSH2_SFTP_ATTR_ACMODTIME;
-    attr.mtime = GetUnixTime(LastWriteTime);
-    attr.atime = attr.mtime;
+    LIBSSH2_SFTP_ATTRIBUTES existing{};
+    int statRc;
+    do {
+        statRc = cs->sftpsession->stat(nameA.data(), &existing);
+        if (statRc == LIBSSH2_ERROR_EAGAIN) WaitForSshIo(cs);
+    } while (statRc == LIBSSH2_ERROR_EAGAIN);
+    if (statRc != 0) return SFTP_FAILED;
+    attr.mtime = LastWriteTime ? GetUnixTime(LastWriteTime) : existing.mtime;
+    attr.atime = LastAccessTime ? GetUnixTime(LastAccessTime) : existing.atime;
     int rc = 0;
     do {
         rc = cs->sftpsession->setstat(nameA.data(), &attr);
@@ -911,7 +918,7 @@ bool SftpLinkFolderTargetW(pConnectSettings cs, LPWSTR RemoteName, size_t maxlen
             WaitForSshIo(cs);
     } while (rc == LIBSSH2_ERROR_EAGAIN && get_ticks_between(start) < 5000);
 
-    if (rc > 0) {
+    if (rc > 0 && static_cast<size_t>(rc) < realBuf.size() && static_cast<size_t>(rc) < maxlen) {
         realBuf[static_cast<size_t>(rc)] = '\0';
         CopyStringA2W(cs, realBuf.data(), RemoteName, maxlen);
         ReplaceSlashByBackslashW(RemoteName);
@@ -942,7 +949,8 @@ void SftpSetTransferModeW(LPCWSTR mode)
 
 bool SftpSupportsResume(pConnectSettings ConnectSettings)
 {
-    return ConnectSettings != nullptr;
+    return ConnectSettings && !ConnectSettings->scponly &&
+        ConnectSettings->transfermode != static_cast<int>(sftp::TransferMode::smb_lan);
 }
 
 int SftpServerSupportsChecksumsW(pConnectSettings ConnectSettings, LPCWSTR RemoteName)

@@ -2,6 +2,10 @@ EXPORTS
 	FsInit
 	FsInitW
 	FsSetCryptCallback
+	FsSetCryptCallbackW
+	FsStatusInfoW
+	FsDisconnectW
+	FsExtractCustomIconW
 	FsFindFirst
 	FsFindFirstW
 	FsFindNext
@@ -31,9 +35,3 @@ EXPORTS
 	FsDisconnect
 	FsExtractCustomIcon
 	FsGetBackgroundFlags
-	FsServerSupportsChecksums
-	FsServerSupportsChecksumsW
-	FsStartFileChecksum
-	FsStartFileChecksumW
-	FsGetFileChecksumResult
-	FsGetFileChecksumResultW

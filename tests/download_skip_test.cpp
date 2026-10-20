@@ -22,26 +22,40 @@ int main() {
     };
     const auto file = dir / "partial.txt";
     std::ofstream(file) << "partial";
-    check(HandleBatchDownloadReadError(L"/synthetic", file.c_str(), false, false) == FS_FILE_READERROR,
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), false, false) == FS_FILE_READERROR,
           "single-file errors are not reported as success");
     BeginDownloadErrorBatch();
     g_skipAllDownloadErrors = true; // Simulate the dialog's Skip all selection.
-    check(HandleBatchDownloadReadError(L"/synthetic", file.c_str(), true, false) == FS_FILE_READERROR &&
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), true, false) == FS_FILE_READERROR &&
           std::filesystem::exists(file), "move error retains the local file and error status");
-    check(HandleBatchDownloadReadError(L"/synthetic", file.c_str(), false, true) == FS_FILE_READERROR &&
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), false, true) == FS_FILE_READERROR &&
           std::filesystem::exists(file), "resume error retains existing partial data");
-    check(HandleBatchDownloadReadError(L"/synthetic", file.c_str(), false, false) == FS_FILE_OK &&
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), false, false) == FS_FILE_OK &&
           !std::filesystem::exists(file), "skip removes the incomplete local file");
     const auto absent = dir / "missing-parent" / "file.txt";
-    check(HandleBatchDownloadReadError(L"/synthetic", absent.c_str(), false, false) == FS_FILE_OK,
+    check(HandleBatchDownloadError(L"/synthetic", absent.c_str(), false, false) == FS_FILE_OK,
           "skip succeeds when the destination parent does not exist");
     std::ofstream(file) << "partial";
     HANDLE locked = CreateFileW(file.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     check(locked != INVALID_HANDLE_VALUE &&
-          HandleBatchDownloadReadError(L"/synthetic", file.c_str(), false, false) == FS_FILE_WRITEERROR &&
-          std::filesystem::exists(file), "locked partial file is not reported as removed");
+          HandleBatchDownloadError(L"/synthetic", file.c_str(), false, false) == FS_FILE_OK &&
+          std::filesystem::exists(file), "locked partial file does not interrupt Skip all");
     CloseHandle(locked);
     std::filesystem::remove(file);
+    std::ofstream(file) << "existing";
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), false, false,
+                                  FS_FILE_WRITEERROR, false) == FS_FILE_OK &&
+          std::filesystem::file_size(file) == 8,
+          "write error is skipped without removing a pre-existing destination");
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), true, false,
+                                  FS_FILE_WRITEERROR) == FS_FILE_WRITEERROR &&
+          std::filesystem::exists(file), "move retains write error and local data");
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), false, true,
+                                  FS_FILE_WRITEERROR) == FS_FILE_WRITEERROR &&
+          std::filesystem::exists(file), "resume retains write error and local data");
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), false, false,
+                                  FS_FILE_WRITEERROR) == FS_FILE_OK &&
+          !std::filesystem::exists(file), "write error removes an owned partial file and continues");
     BeginDownloadErrorBatch();
     EndDownloadErrorBatch();
     check(g_skipAllDownloadErrors, "nested batch does not reset the outer choice");
@@ -53,6 +67,9 @@ int main() {
     BeginDownloadErrorBatch();
     check(!g_skipAllDownloadErrors, "next batch asks again");
     EndDownloadErrorBatch();
+    check(HandleBatchDownloadError(L"/synthetic", file.c_str(), false, false,
+                                  FS_FILE_WRITEERROR) == FS_FILE_WRITEERROR,
+          "single-file write errors retain their original result");
     std::filesystem::remove(dir);
     return failures ? 1 : 0;
 }

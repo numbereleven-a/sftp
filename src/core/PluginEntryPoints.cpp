@@ -44,7 +44,6 @@ std::array<WCHAR, 32> s_f7newconnectionW{};
 std::array<WCHAR, 32> s_quickconnectW{};
 
 bool disablereading = false;   // disable reading of subdirs to delete whole drives
-bool freportconnect = true;    // report connect to caller only on first connect
 bool CryptCheckPass = false;   // check 'store password encrypted' by default
 
 int PluginNumber = 0;
@@ -264,7 +263,8 @@ BOOL APIENTRY DllMain( HANDLE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     }
     if (ul_reason_for_call == DLL_PROCESS_DETACH) {
         // Stop LAN services before CRT destroys global objects
-        StopGlobalLanServices();
+        // LAN services pin this module while workers exist. During process
+        // termination Windows closes their sockets; never join under loader lock.
         ShutdownMultiServer();
         if (g_winsockInitialized) {
             WSACleanup();
@@ -506,7 +506,7 @@ static int _FsInit(int PluginNr)
     // Load language now in case FsSetDefaultParams was not called yet or registry lookup failed.
     DetectAndApplyLanguage(nullptr);
 
-    InitMultiServer();
+
     // LAN Pair services (file server + UDP discovery) are started lazily on
     // first LAN Pair use (LanPairConnect / connection dialog), NOT on plugin
     // load: the plugin must not listen on the network unless the user actually
@@ -835,4 +835,64 @@ int WINAPI FsGetFileChecksumResult(BOOL WantResult, HANDLE ChecksumHandle, LPCST
         std::array<WCHAR, wdirtypemax> remoteNameW{};
         return FsGetFileChecksumResultW(!!WantResult, ChecksumHandle, awlcopy(remoteNameW.data(), RemoteName, remoteNameW.size() - 1), checksum, maxlen);
     });
+}
+
+namespace {
+tCryptProcW wideCryptCallback = nullptr;
+int WINAPI CryptCallbackBridge(int plugin, int crypto, int mode, LPCSTR connection, LPSTR password, int capacity)
+{
+    std::array<wchar_t, wdirtypemax> connectionW{};
+    awlcopy(connectionW.data(), connection ? connection : "", connectionW.size());
+    const size_t wideCapacity = capacity > 0 ? static_cast<size_t>(capacity) : 4096;
+    std::vector<wchar_t> passwordW(wideCapacity, L'\0');
+    struct Wipe { std::vector<wchar_t>& value; ~Wipe() { SecureZeroMemory(value.data(), value.size() * sizeof(wchar_t)); } } wipe{passwordW};
+    if (password && *password && (mode == FS_CRYPT_SAVE_PASSWORD || mode == FS_CRYPT_COPY_PASSWORD || mode == FS_CRYPT_MOVE_PASSWORD)) {
+        const UINT codepage = mode == FS_CRYPT_SAVE_PASSWORD ? CP_UTF8 : CP_ACP;
+        if (!MultiByteToWideChar(codepage, codepage == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0, password, -1,
+                                 passwordW.data(), static_cast<int>(passwordW.size()))) return FS_FILE_WRITEERROR;
+    }
+    const int rc = wideCryptCallback(plugin, crypto, mode, connectionW.data(),
+                                     password ? passwordW.data() : nullptr,
+                                     capacity > 0 ? static_cast<int>(passwordW.size()) : 0);
+    if (rc == FS_FILE_OK && password && capacity > 0) {
+        if (!WideCharToMultiByte(CP_UTF8, 0, passwordW.data(), -1, password, capacity, nullptr, nullptr))
+            return FS_FILE_READERROR;
+    }
+    SecureZeroMemory(passwordW.data(), passwordW.size() * sizeof(wchar_t));
+    return rc;
+}
+std::string StatusRoot(LPCWSTR path)
+{
+    std::wstring root = path ? path : L"";
+    const size_t separator = root.find(L'\\', 1);
+    if (separator != root.npos) root.resize(separator);
+    std::vector<char> narrow(root.size() * 4 + 1);
+    walcopy(narrow.data(), root.c_str(), narrow.size());
+    return narrow.data();
+}
+}
+
+void WINAPI FsSetCryptCallbackW(tCryptProcW callback, int crypto, int flags)
+{
+    wideCryptCallback = callback;
+    FsSetCryptCallback(callback ? CryptCallbackBridge : nullptr, crypto, flags);
+}
+
+void WINAPI FsStatusInfoW(LPCWSTR directory, int startEnd, int operation)
+{
+    const std::string root = StatusRoot(directory);
+    FsStatusInfo(root.c_str(), startEnd, operation);
+}
+
+BOOL WINAPI FsDisconnectW(LPCWSTR root)
+{
+    const std::string name = StatusRoot(root);
+    return FsDisconnect(name.c_str());
+}
+
+int WINAPI FsExtractCustomIconW(LPCWSTR name, int flags, HICON* icon)
+{
+    if (!name || !icon || wcschr(name + (name[0] ? 1 : 0), L'\\')) return FS_ICON_USEDEFAULT;
+    const std::string root = StatusRoot(name);
+    return FsExtractCustomIcon(root.c_str(), flags, icon);
 }

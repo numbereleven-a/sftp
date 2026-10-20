@@ -57,8 +57,11 @@ static std::unique_ptr<ISshBackend> g_sshBackend;
 
 // Global LAN Pair file server: started at plugin init, serves all authenticated peers.
 // Also the discovery service that announces this machine's presence.
-static std::unique_ptr<LanFileServer>    g_lanFileServer;
-static std::unique_ptr<lanpair::DiscoveryService> g_lanDiscovery;
+static LanFileServer* g_lanFileServer = nullptr;
+static lanpair::DiscoveryService* g_lanDiscovery = nullptr;
+static std::string g_lanServerPassword;
+static std::vector<std::string> g_lanServerRoots;
+static bool g_lanServerTi = false;
 
 namespace {
 
@@ -390,8 +393,11 @@ int mysend(SOCKET s, LPCSTR buf, int len, int flags, LPCSTR progressmessage, int
             return ret;
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK) {
+            IsSocketWritable(s);
             if (ProgressLoop(progressmessage, progressstart, progressstart + 10, ploop, plasttime))
                 break;
+        } else {
+            break;
         }
     }
     return ret;
@@ -436,24 +442,29 @@ static std::string MakeLanPeerId()
 
 void StartGlobalLanServices(bool startServer)
 {
+    HMODULE module{};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(&StartGlobalLanServices), &module);
     if (startServer && (!g_lanFileServer || !g_lanFileServer->isRunning())) {
-        g_lanFileServer = std::make_unique<LanFileServer>();
+        if (g_lanServerPassword.empty() || g_lanServerRoots.empty()) return;
+        // A module with active workers must remain mapped until process exit.
+        HMODULE pinned{};
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(&StartGlobalLanServices), &pinned);
+        delete g_lanFileServer;
+        g_lanFileServer = new LanFileServer();
+        g_lanFileServer->setPassword(g_lanServerPassword);
+        g_lanFileServer->setAllowedRoots(g_lanServerRoots);
+        g_lanFileServer->setTrustedInstaller(g_lanServerTi);
         lanpair::PairError err;
         if (!g_lanFileServer->start(45846, &err)) {
             SFTP_LOG("LAN", "LanFileServer start failed: %s", err.message.c_str());
-            g_lanFileServer.reset();
-        } else {
-            // Restore previously saved server password (set when any LAN Pair profile was connected).
-            std::string storedPw;
-            if (lanpair::DpapiSecretStore::loadSecret("lanpair-server-pw", &storedPw, nullptr) &&
-                !storedPw.empty()) {
-                g_lanFileServer->setPassword(storedPw);
-            }
+            delete g_lanFileServer; g_lanFileServer = nullptr;
         }
     }
 
     if (!g_lanDiscovery) {
-        g_lanDiscovery = std::make_unique<lanpair::DiscoveryService>();
+        g_lanDiscovery = new lanpair::DiscoveryService();
         lanpair::DiscoveryConfig cfg;
         const std::string peerId = MakeLanPeerId();
         char host[256] = {};
@@ -462,40 +473,63 @@ void StartGlobalLanServices(bool startServer)
         if (!g_lanDiscovery->start(cfg, peerId, host, lanpair::PairRole::Dual,
                                    nullptr, &derr)) {
             SFTP_LOG("LAN", "LanDiscovery start failed: %s", derr.message.c_str());
-            g_lanDiscovery.reset();
+            delete g_lanDiscovery; g_lanDiscovery = nullptr;
         }
     }
 }
 
 void LanFileServerSetPassword(const std::string& pw)
 {
+    g_lanServerPassword = pw;
     if (g_lanFileServer)
         g_lanFileServer->setPassword(pw);
 }
 
 void LanFileServerSetTrustedInstaller(bool enabled)
 {
+    g_lanServerTi = enabled;
     if (g_lanFileServer)
         g_lanFileServer->setTrustedInstaller(enabled);
 }
 
+void LanFileServerSetRoot(const std::string& root)
+{
+    g_lanServerRoots = root.empty() ? std::vector<std::string>{} : std::vector<std::string>{root};
+    if (g_lanFileServer) {
+        g_lanFileServer->stop();
+        g_lanFileServer->setAllowedRoots(g_lanServerRoots);
+    }
+}
+
 void StopGlobalLanServices()
 {
-    if (g_lanDiscovery) { g_lanDiscovery->stop(); g_lanDiscovery.reset(); }
-    if (g_lanFileServer) { g_lanFileServer->stop(); g_lanFileServer.reset(); }
+    if (g_lanDiscovery) { g_lanDiscovery->stop(); delete g_lanDiscovery; g_lanDiscovery = nullptr; }
+    if (g_lanFileServer) { g_lanFileServer->stop(); delete g_lanFileServer; g_lanFileServer = nullptr; }
 }
 
 // Connect a LAN Pair session: run discovery to find the peer's current IP,
 // then connect + authenticate with DPAPI trust key.
 static int LanPairConnect(pConnectSettings cs)
 {
+    // Configure the donor before opening the listening socket.
+    if (cs->lan_pair_role != 1) {
+        if (cs->password.empty() || cs->lan_pair_root.empty()) {
+            if (cs->feedback) cs->feedback->ShowError("LAN Pair: set a password and select a shared folder using Pair.");
+            return SFTP_FAILED;
+        }
+        LanFileServerSetPassword(cs->password);
+        LanFileServerSetRoot(cs->lan_pair_root);
+        LanFileServerSetTrustedInstaller(cs->lan_pair_trusted_installer);
+    }
     // lan_pair_role: 0=mutual, 1=receiver (biorca), 2=donor (dawca)
     if (cs->lan_pair_role == 2) {
-        StartGlobalLanServices(true);   // ensure our server is running for inbound connections
-        if (cs->feedback)
-            cs->feedback->ShowError(LngStrU8(IDS_LAN_ERR_DONOR_NO_CONNECT,
-                "LAN Pair: this machine is configured as Donor. The remote Receiver must connect here.").c_str());
-        return SFTP_FAILED;
+        StartGlobalLanServices(true);
+        if (!g_lanFileServer || !g_lanFileServer->isRunning()) {
+            if (cs->feedback) cs->feedback->ShowError("LAN Pair donor could not start. Check the selected folder and listening port.");
+            return SFTP_FAILED;
+        }
+        ShowStatus("LAN Pair donor is running and waiting for a receiver.");
+        return SFTP_OK;
     }
     // Receiver (role==1) does not start a local file server; mutual (role==0) starts both.
     StartGlobalLanServices(cs->lan_pair_role == 0);

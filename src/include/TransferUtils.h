@@ -10,5 +10,5 @@ bool AskUserYesNo(pConnectSettings ConnectSettings, LPCSTR title, LPCSTR message
 std::string ToRemotePathA(pConnectSettings cs, LPCWSTR pathW);
 int CheckInputOrTimeout(pConnectSettings ConnectSettings, bool timeout, SYSTICKS starttime, int percent);
 int CloseRemote(pConnectSettings ConnectSettings, ISftpHandle* remotefilesftp, ISshChannel* remotefilescp, bool timeout, int percent);
-int ConvertCrToCrLf(LPSTR data, size_t len, bool* pLastWasCr);
+int ConvertCrToCrLf(LPSTR data, size_t len, size_t capacity, bool* pLastWasCr);
 bool SftpDetermineTransferModeW(LPCWSTR RemoteName);

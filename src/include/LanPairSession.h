@@ -1,4 +1,5 @@
 #pragma once
+#include <winsock2.h>
 #include "LanPair.h"
 #include <memory>
 #include <string>
@@ -111,6 +112,7 @@ public:
     // Set the shared password used to verify first-time connections from new peers.
     // Call after start(); may be called at any time from any thread.
     void setPassword(const std::string& password) noexcept;
+    void setAllowedRoots(const std::vector<std::string>& roots) noexcept;
 
     // Enable or disable TrustedInstaller impersonation for incoming file operations.
     void setTrustedInstaller(bool enabled) noexcept;

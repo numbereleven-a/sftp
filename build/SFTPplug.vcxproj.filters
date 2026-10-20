@@ -55,6 +55,7 @@
     <ClCompile Include="..\src\core\SftpTransfer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\core\TextConversion.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="..\src\core\TransferUtils.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -74,9 +75,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\src\core\UnicodeHelpers.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\src\core\FtpDirectoryParser.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\src\core\UtfConversion.cpp">

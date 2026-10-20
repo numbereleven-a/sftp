@@ -42,7 +42,8 @@ if (!function_exists('ctype_digit')) {
 // ---------------------------------------------------------------------
 
 const AGENT_NAME = 'TC PHP Agent';
-const AGENT_VERSION = '1.0.1';
+const AGENT_VERSION = '2.0.0';
+const AGENT_ALLOW_SHELL = false;
 const AGENT_PSK = 'CHANGE_ME_TO_LONG_RANDOM_SECRET';
 const AGENT_PSK_SALT = '';
 const AGENT_PSK_SHA256 = '';
@@ -129,21 +130,12 @@ try {
 
 function op_probe(): void
 {
-    $ini = collect_ini_info();
-    $caps = collect_capabilities($ini);
-    ok([
-        'agent' => [
-            'name' => AGENT_NAME,
-            'version' => AGENT_VERSION,
-        ],
-        'runtime' => [
-            'php_version' => PHP_VERSION,
-            'sapi' => PHP_SAPI,
-            'os_family' => PHP_OS_FAMILY,
-        ],
-        'ini' => $ini,
-        'capabilities' => $caps,
-    ]);
+    ok(['agent' => ['name' => AGENT_NAME, 'version' => AGENT_VERSION],
+        'capabilities' => [
+            'recommended_chunk_size' => recommended_chunk_size(),
+            'auth' => ['hmac_auth' => resolve_agent_psk_for_hmac() !== '',
+                       'signature_version' => 2, 'salt' => resolve_agent_psk_salt(),
+                       'legacy_header_auth' => false]]]);
 }
 
 function op_list(): void
@@ -268,6 +260,7 @@ function op_get(): void
     header('Accept-Ranges: bytes');
 
     // Disable userland output buffering for streaming.
+    tar_preflight($absPath);
     while (ob_get_level() > 0) {
         @ob_end_clean();
     }
@@ -299,6 +292,7 @@ function op_tar_stream(): void
         fail(404, 'NOT_A_DIRECTORY', 'Path is not a directory');
     }
 
+    tar_preflight($absPath);
     while (ob_get_level() > 0) {
         @ob_end_clean();
     }
@@ -323,6 +317,18 @@ function op_tar_stream(): void
     exit;
 }
 
+function tar_preflight(string $path): void
+{
+    if (is_link($path)) return;
+    if (is_file($path)) {
+        if ((int)filesize($path) > 8589934591) fail(413, 'TOO_LARGE', 'File exceeds ustar limit');
+        return;
+    }
+    foreach (new DirectoryIterator($path) as $item) {
+        if (!$item->isDot() && !$item->isLink()) tar_preflight($item->getPathname());
+    }
+}
+
 function tar_stream_dir(string $rootAbs, string $dirAbs, $out, string $relPath): bool
 {
     $dh = @opendir($dirAbs);
@@ -338,6 +344,7 @@ function tar_stream_dir(string $rootAbs, string $dirAbs, $out, string $relPath):
         }
         $childAbs = $dirAbs . DIRECTORY_SEPARATOR . $name;
         $childRel = ($relPath === '') ? $name : $relPath . '/' . $name;
+        if (is_link($childAbs)) continue;
 
         if (is_dir($childAbs) && !is_link($childAbs)) {
             $mtime = (int)@filemtime($childAbs);
@@ -363,7 +370,7 @@ function tar_stream_dir(string $rootAbs, string $dirAbs, $out, string $relPath):
             }
             
             if ($size > 0) {
-                $copied = @stream_copy_to_stream($fp, $out);
+                $copied = @stream_copy_to_stream($fp, $out, $size);
                 if ($copied === false || $copied < $size) {
                     fclose($fp);
                     closedir($dh);
@@ -466,7 +473,7 @@ function op_tar_extract(): void
     if (!is_dir($absPath) && !@mkdir($absPath, 0775, true)) {
         fail(500, 'MKDIR_FAILED', 'Cannot create target directory');
     }
-    $in = @fopen('php://input', 'rb');
+    $in = verified_input();
     if ($in === false) {
         fail(500, 'INPUT_OPEN_FAILED', 'Failed to open input stream');
     }
@@ -501,25 +508,65 @@ function tar_skip_exact($in, int $n): bool
     return true;
 }
 
+function tar_number(string $field): int
+{
+    if ((ord($field[0]) & 0x80) !== 0) {
+        $value = ord($field[0]) & 0x7f;
+        for ($i = 1; $i < strlen($field); ++$i) {
+            if ($value > intdiv(PHP_INT_MAX - ord($field[$i]), 256)) fail(400, 'BAD_TAR', 'Numeric overflow');
+            $value = $value * 256 + ord($field[$i]);
+        }
+        return $value;
+    }
+    $text = trim($field, "\0 ");
+    if ($text !== '' && !preg_match('/^[0-7]+$/', $text)) fail(400, 'BAD_TAR', 'Invalid octal number');
+    return $text === '' ? 0 : (int)octdec($text);
+}
+
 function tar_extract_stream(string $rootAbs, $in): int
 {
     $rootAbs = rtrim(str_replace('\\', '/', $rootAbs), '/');
     $pendingLongName = '';
+    $pax = [];
     $count = 0;
     for (;;) {
         $hdr = tar_read_exact($in, 512);
-        if ($hdr === null || strlen($hdr) < 512) break;
+        if ($hdr === null || strlen($hdr) < 512) fail(400, 'BAD_TAR', 'Truncated header');
         if ($hdr === str_repeat("\0", 512)) break;
+        $storedChecksum = tar_number(substr($hdr, 148, 8));
+        $checksum = array_sum(unpack('C*', substr_replace($hdr, str_repeat(' ', 8), 148, 8)));
+        if ($storedChecksum !== $checksum) fail(400, 'BAD_TAR', 'Invalid header checksum');
         $typeflag   = $hdr[156];
         $sizeStr    = trim(substr($hdr, 124, 12), "\0 ");
-        $fileSize   = ($sizeStr !== '') ? (int)octdec($sizeStr) : 0;
+        $fileSize = tar_number(substr($hdr, 124, 12));
         $nameRaw    = rtrim(substr($hdr, 0, 100), "\0");
         $prefix     = rtrim(substr($hdr, 345, 155), "\0");
         $entryPath  = ($prefix !== '') ? ($prefix . '/' . $nameRaw) : $nameRaw;
-        $paddedSize = (int)(($fileSize + 511) / 512) * 512;
+        if ($fileSize < 0 || $fileSize > PHP_INT_MAX - 511) fail(400, 'BAD_TAR', 'Invalid file size');
+        $paddedSize = intdiv($fileSize + 511, 512) * 512;
+        if ($typeflag === 'x' || $typeflag === 'g') {
+            if ($fileSize > 65536 || $typeflag === 'g') fail(400, 'BAD_TAR', 'Unsupported or oversized global metadata');
+            $metadata = tar_read_exact($in, $paddedSize);
+            if ($metadata === null) fail(400, 'BAD_TAR', 'Truncated PAX metadata');
+            $pax = [];
+            for ($i = 0; $i < $fileSize;) {
+                $space = strpos($metadata, ' ', $i);
+                if ($space === false) fail(400, 'BAD_TAR', 'Invalid PAX record');
+                $lengthText = substr($metadata, $i, $space - $i);
+                if (!ctype_digit($lengthText)) fail(400, 'BAD_TAR', 'Invalid PAX length');
+                $length = (int)$lengthText;
+                if ($length <= $space - $i + 1 || $i + $length > $fileSize) fail(400, 'BAD_TAR', 'Invalid PAX bounds');
+                $record = substr($metadata, $space + 1, $i + $length - $space - 2);
+                $equal = strpos($record, '=');
+                if ($equal !== false) $pax[substr($record, 0, $equal)] = substr($record, $equal + 1);
+                $i += $length;
+            }
+            continue;
+        }
         if ($typeflag === 'L') {
+            if ($fileSize > 65536) fail(400, 'BAD_TAR', 'Long name is too large');
             $longData = ($paddedSize > 0) ? tar_read_exact($in, $paddedSize) : '';
-            if ($longData === null) break;
+            if ($longData === null) fail(400, 'BAD_TAR', 'Truncated long name');
             $pendingLongName = rtrim(substr((string)$longData, 0, $fileSize), "\0");
             continue;
         }
@@ -527,12 +574,22 @@ function tar_extract_stream(string $rootAbs, $in): int
             $entryPath = $pendingLongName;
             $pendingLongName = '';
         }
+        if (isset($pax['path'])) $entryPath = $pax['path'];
+        if (isset($pax['size'])) {
+            if (!preg_match('/^[0-9]{1,12}$/', $pax['size'])) fail(400, 'BAD_TAR', 'Invalid PAX size');
+            $fileSize = (int)$pax['size'];
+            $paddedSize = intdiv($fileSize + 511, 512) * 512;
+        }
+        $pax = [];
+        if (!in_array($typeflag, ["\0", '0', '5'], true)) fail(400, 'BAD_TAR', 'Unsupported entry type');
         $entryPath = str_replace('\\', '/', trim($entryPath, '/'));
         if ($entryPath === '' || strpos($entryPath, '..') !== false) {
             if ($paddedSize > 0) tar_skip_exact($in, $paddedSize);
             continue;
         }
+        normalize_rel($entryPath);
         $absTarget = $rootAbs . '/' . $entryPath;
+        validate_write_target($absTarget);
         if ($typeflag === '5') {
             @mkdir($absTarget, 0755, true);
             if ($paddedSize > 0) tar_skip_exact($in, $paddedSize);
@@ -540,6 +597,7 @@ function tar_extract_stream(string $rootAbs, $in): int
         }
         $parentDir = dirname($absTarget);
         if (!is_dir($parentDir)) @mkdir($parentDir, 0755, true);
+        validate_write_target($absTarget);
         $fp = @fopen($absTarget, 'wb');
         if ($fp === false) {
             if ($paddedSize > 0) tar_skip_exact($in, $paddedSize);
@@ -562,7 +620,7 @@ function tar_extract_stream(string $rootAbs, $in): int
             tar_skip_exact($in, $paddedSize - (int)($copied ?? 0));
         }
         fclose($fp);
-        if (!$ok) break;
+        if (!$ok) fail(400, 'BAD_TAR', 'Truncated file data');
         ++$count;
     }
     return $count;
@@ -572,13 +630,18 @@ function tar_extract_stream(string $rootAbs, $in): int
 // returns them as a TAR archive (buffered for hosting compatibility).
 function op_tar_pack(): void
 {
-    $body = (string)file_get_contents('php://input');
+    $body = verified_body_text();
     $lines = preg_split('/\r?\n/', $body);
     if ($lines === false) {
         fail(400, 'EMPTY_LIST', 'No paths provided');
     }
 
     $root = root_realpath();
+    foreach ($lines as $item) {
+        if (trim($item) === '') continue;
+        $abs = resolve_path(normalize_rel(trim($item)), true);
+        if (is_file($abs) && (int)filesize($abs) > 8589934591) fail(413, 'TOO_LARGE', 'File exceeds ustar limit');
+    }
     set_time_limit(0);
 
     while (ob_get_level() > 0) @ob_end_clean();
@@ -603,7 +666,7 @@ function op_tar_pack(): void
             continue;
         }
         $real = normalize_abs($real);
-        if (!str_starts_with($real, $root)) {
+        if (!path_in_jail($real, $root)) {
             continue;
         }
         if (is_dir($real)) {
@@ -697,7 +760,7 @@ function op_put(): void
         fail(500, 'SEEK_FAILED', 'Failed to seek target file');
     }
 
-    $in = fopen('php://input', 'rb');
+    $in = verified_input();
     if ($in === false) {
         flock($fp, LOCK_UN);
         fclose($fp);
@@ -824,6 +887,7 @@ function op_rmdir(): void
         fail(404, 'NOT_A_DIRECTORY', 'Path is not a directory');
     }
 
+    if ($absPath === root_realpath()) fail(400, 'BAD_PATH', 'Cannot remove jail root');
     $recursive = bool_param('recursive', false);
     if ($recursive) {
         remove_tree($absPath);
@@ -888,6 +952,7 @@ function op_hash(): void
 
 function op_shell_exec(): void
 {
+    if (!AGENT_ALLOW_SHELL) fail(403, 'SHELL_DISABLED', 'Shell access is disabled');
     $cmd = trim((string)get_param('cmd', ''));
     if ($cmd === '') {
         fail(400, 'INVALID_COMMAND', 'Command is required');
@@ -933,41 +998,7 @@ function op_shell_exec(): void
 
 function resolve_shell_cwd(string $cwdRaw): string
 {
-    $cwdRaw = str_replace("\0", '', trim($cwdRaw));
-    $cwdRaw = str_replace('\\', '/', $cwdRaw);
-    if ($cwdRaw === '' || $cwdRaw === '.') {
-        $cwd = @getcwd();
-        if (is_string($cwd) && $cwd !== '') {
-            return normalize_abs($cwd);
-        }
-        return root_realpath();
-    }
-
-    // Absolute path for shell mode: allow any existing readable directory.
-    if (str_starts_with($cwdRaw, '/')) {
-        $real = realpath($cwdRaw);
-        if ($real === false) {
-            fail(404, 'INVALID_CWD', 'Working directory does not exist');
-        }
-        $real = normalize_abs($real);
-        return $real;
-    }
-
-    // Relative path for shell mode: resolve against current working directory.
-    $base = @getcwd();
-    if (!is_string($base) || $base === '') {
-        $base = root_realpath();
-    }
-    $target = normalize_abs($base . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $cwdRaw));
-    $real = realpath($target);
-    if ($real === false) {
-        fail(404, 'INVALID_CWD', 'Working directory does not exist');
-    }
-    $real = normalize_abs($real);
-    if (!is_dir($real) || !is_readable($real)) {
-        fail(404, 'INVALID_CWD', 'Working directory is invalid');
-    }
-    return $real;
+    return resolve_path(normalize_rel($cwdRaw), true);
 }
 
 // ---------------------------------------------------------------------
@@ -976,6 +1007,9 @@ function resolve_shell_cwd(string $cwdRaw): string
 
 function require_auth(string $method, string $op): void
 {
+    if (str_contains(strtolower($_SERVER['CONTENT_TYPE'] ?? ''), 'multipart/')) {
+        fail(400, 'UNSUPPORTED_CONTENT_TYPE', 'Multipart requests are not supported');
+    }
     $legacyConfigured = is_legacy_psk_configured();
     $hmacPsk = resolve_agent_psk_for_hmac();
     if (!$legacyConfigured && $hmacPsk === '') {
@@ -1011,7 +1045,24 @@ function require_auth(string $method, string $op): void
         }
 
         $path = normalize_rel((string)get_param('path', ''));
-        $base = strtoupper($method) . "\n" . $op . "\n" . $path . "\n" . $ts . "\n" . $nonce;
+        if (get_header('x-sftp-signature-version', '') !== '2') {
+            fail(401, 'SIGNATURE_VERSION', 'Update the plugin and agent together');
+        }
+        $input = fopen('php://input', 'rb');
+        $verified = fopen('php://temp/maxmemory:1048576', 'w+b');
+        $hash = hash_init('sha256');
+        while (!feof($input)) {
+            $chunk = fread($input, 65536);
+            if ($chunk === false) fail(400, 'BODY_READ_FAILED', 'Unable to read request');
+            hash_update($hash, $chunk);
+            if (fwrite($verified, $chunk) !== strlen($chunk)) fail(507, 'BODY_STORAGE_FAILED', 'Unable to spool request');
+        }
+        fclose($input);
+        $bodyHash = hash_final($hash);
+        rewind($verified);
+        $GLOBALS['verified_body'] = $verified;
+        $base = strtoupper($method) . "\n" . $op . "\n" . ($_SERVER['REQUEST_URI'] ?? '') .
+            "\n" . $ts . "\n" . $nonce . "\n" . $bodyHash;
         $expected = hash_hmac('sha256', $base, $hmacPsk);
         if (!hash_equals($expected, strtolower($sig))) {
             fail(401, 'BAD_SIGNATURE', 'Signature mismatch');
@@ -1024,12 +1075,8 @@ function require_auth(string $method, string $op): void
         return;
     }
 
-    // Legacy bearer mode: older clients that only understand X-SFTP-AUTH.
-    $legacyAuth = get_header('x-sftp-auth', '');
-    if ($legacyAuth !== '' && verify_legacy_auth($legacyAuth)) {
-        return;
-    }
-    fail(401, 'AUTH_REQUIRED', 'Missing auth headers');
+    fail(401, 'AUTH_REQUIRED', 'Signed requests are required');
+
 }
 
 function resolve_agent_psk_plain(): string
@@ -1069,7 +1116,8 @@ function resolve_agent_psk_plain(): string
 
 function resolve_agent_psk_for_hmac(): string
 {
-    return resolve_agent_psk_plain();
+    $plain = resolve_agent_psk_plain();
+    return $plain !== '' ? hash('sha256', $plain) : resolve_agent_psk_hash();
 }
 
 function resolve_agent_psk_hash(): string
@@ -1149,9 +1197,6 @@ function get_param(string $name, $default = null)
     if (array_key_exists($name, $_GET)) {
         return $_GET[$name];
     }
-    if (array_key_exists($name, $_POST)) {
-        return $_POST[$name];
-    }
 
     static $jsonBody = null;
     if ($jsonBody === null) {
@@ -1221,7 +1266,7 @@ function fail(int $status, string $code, string $message): void
 
 function normalize_rel(string $path): string
 {
-    $path = str_replace("\0", '', $path);
+    if (strpos($path, "\0") !== false) fail(400, 'INVALID_PATH', 'NUL in path');
     $path = str_replace('\\', '/', trim($path));
     if ($path === '' || $path === '.') {
         return '.';
@@ -1233,12 +1278,7 @@ function normalize_rel(string $path): string
         if ($part === '' || $part === '.') {
             continue;
         }
-        if ($part === '..') {
-            if (count($parts) > 0) {
-                array_pop($parts);
-            }
-            continue;
-        }
+        if ($part === '..') fail(403, 'PATH_ESCAPE', 'Parent traversal is not allowed');
         $parts[] = $part;
     }
     if (!$parts) {
@@ -1264,6 +1304,41 @@ function root_realpath(): string
     return normalize_abs($root);
 }
 
+function path_in_jail(string $path, string $root): bool
+{
+    $root = rtrim(str_replace('\\', '/', normalize_abs($root)), '/');
+    $path = str_replace('\\', '/', normalize_abs($path));
+    if (DIRECTORY_SEPARATOR === '\\') { $root = strtolower($root); $path = strtolower($path); }
+    return $path === $root || str_starts_with($path, $root . '/');
+}
+
+function validate_write_target(string $target): void
+{
+    $root = root_realpath();
+    $part = $target;
+    while (!file_exists($part) && !is_link($part)) {
+        $parent = dirname($part);
+        if ($parent === $part) fail(403, 'PATH_ESCAPE', 'Invalid target ancestor');
+        $part = $parent;
+    }
+    $real = realpath($part);
+    if ($real === false || !path_in_jail($real, $root)) {
+        fail(403, 'PATH_ESCAPE', 'Target or ancestor escapes root');
+    }
+}
+
+function verified_input()
+{
+    if (!isset($GLOBALS['verified_body'])) fail(401, 'AUTH_REQUIRED', 'Verified body is unavailable');
+    rewind($GLOBALS['verified_body']);
+    return $GLOBALS['verified_body'];
+}
+
+function verified_body_text(): string
+{
+    return (string)stream_get_contents(verified_input());
+}
+
 function resolve_path(string $rel, bool $mustExist): string
 {
     $root = root_realpath();
@@ -1277,7 +1352,7 @@ function resolve_path(string $rel, bool $mustExist): string
             fail(404, 'NOT_FOUND', 'Path not found');
         }
         $real = normalize_abs($real);
-        if (!str_starts_with($real, $root)) {
+        if (!path_in_jail($real, $root)) {
             fail(403, 'PATH_ESCAPE', 'Resolved path escapes root');
         }
         return $real;
@@ -1289,9 +1364,10 @@ function resolve_path(string $rel, bool $mustExist): string
         fail(404, 'PARENT_NOT_FOUND', 'Parent directory not found');
     }
     $parentReal = normalize_abs($parentReal);
-    if (!str_starts_with($parentReal, $root)) {
+    if (!path_in_jail($parentReal, $root)) {
         fail(403, 'PATH_ESCAPE', 'Parent path escapes root');
     }
+    validate_write_target($target);
     return normalize_abs($target);
 }
 
@@ -1303,7 +1379,7 @@ function resolve_path_for_create(string $rel): string
     }
     $target = $root . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $rel);
     $target = normalize_abs($target);
-    if (!str_starts_with($target, $root)) {
+    if (!path_in_jail($target, $root)) {
         fail(403, 'PATH_ESCAPE', 'Target path escapes root');
     }
 
@@ -1311,15 +1387,17 @@ function resolve_path_for_create(string $rel): string
     $parentReal = realpath($parent);
     if ($parentReal !== false) {
         $parentReal = normalize_abs($parentReal);
-        if (!str_starts_with($parentReal, $root)) {
+        if (!path_in_jail($parentReal, $root)) {
             fail(403, 'PATH_ESCAPE', 'Parent path escapes root');
         }
     }
+    validate_write_target($target);
     return $target;
 }
 
 function ensure_parent_dir(string $absPath): void
 {
+    validate_write_target($absPath);
     $parent = dirname($absPath);
     if (is_dir($parent)) {
         return;
@@ -1327,6 +1405,7 @@ function ensure_parent_dir(string $absPath): void
     if (!@mkdir($parent, 0775, true) && !is_dir($parent)) {
         fail(500, 'MKDIR_FAILED', 'Unable to create parent directory');
     }
+    validate_write_target($absPath);
 }
 
 function normalize_abs(string $path): string
@@ -1387,13 +1466,14 @@ function remove_tree(string $dir): void
 
 function enforce_nonce_once(string $nonce, int $ts): void
 {
-    $base = root_realpath() . DIRECTORY_SEPARATOR . AGENT_REPLAY_DIR;
+    $base = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'sftp-nonce-' .
+        hash('sha256', root_realpath() . '|' . __FILE__);
     if (!is_dir($base) && !@mkdir($base, 0700, true) && !is_dir($base)) {
         fail(500, 'NONCE_STORAGE_FAILED', 'Nonce cache directory creation failed');
     }
 
     // Prune old nonce files opportunistically to reduce per-request I/O.
-    if (mt_rand(1, 100) <= 2) {
+    {
         $now = time();
         $dh = @opendir($base);
         if ($dh !== false) {
@@ -1411,6 +1491,9 @@ function enforce_nonce_once(string $nonce, int $ts): void
         }
     }
 
+    if (count(glob($base . '/*.n') ?: []) >= 10000) {
+        fail(503, 'NONCE_CACHE_FULL', 'Replay storage is full');
+    }
     $key = hash('sha256', $nonce . '|' . $ts);
     $file = $base . DIRECTORY_SEPARATOR . $key . '.n';
     // Atomic create: fopen('x') fails when the file already exists, so two
@@ -1468,7 +1551,7 @@ function collect_capabilities(array $ini): array
     $ops = [
         'LIST', 'STAT', 'GET', 'PUT', 'FINALIZE', 'DELETE', 'MKDIR', 'RMDIR', 'RENAME', 'HASH'
     ];
-    if (pick_shell_method($disabled) !== '') {
+    if (AGENT_ALLOW_SHELL && pick_shell_method($disabled) !== '') {
         $ops[] = 'SHELL_EXEC';
     }
     $ops[] = 'TAR_STREAM';
@@ -1494,7 +1577,7 @@ function collect_capabilities(array $ini): array
             'probe_public' => true,
             'psk_configured' => is_legacy_psk_configured(),
             'psk_source' => resolve_agent_psk_source(),
-            'legacy_header_auth' => true,
+            'legacy_header_auth' => false,
             'hmac_auth' => resolve_agent_psk_for_hmac() !== '',
         ],
         'operations' => $ops,
@@ -1614,7 +1697,7 @@ function execute_shell_command(string $cmd, string $method): array
 
     if ($method === 'shell_exec') {
         $out = @shell_exec($cmd . ' 2>&1');
-        return ['stdout' => (string)($out ?? ''), 'stderr' => '', 'exit_code' => 0];
+        return ['stdout' => (string)($out ?? ''), 'stderr' => '', 'exit_code' => -1];
     }
 
     if ($method === 'exec') {

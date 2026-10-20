@@ -4,7 +4,6 @@ typedef LPVOID  SERVERID;
 typedef LPVOID  SERVERHANDLE;
 
 // Lifecycle
-void InitMultiServer() noexcept;
 void ShutdownMultiServer() noexcept;   // DeleteCriticalSection + FreeServerList
 void FreeServerList() noexcept;
 

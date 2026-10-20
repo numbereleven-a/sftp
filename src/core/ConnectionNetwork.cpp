@@ -37,6 +37,7 @@ int EstablishSocketConnection(pConnectSettings ConnectSettings, LPCSTR connectto
         }
         return -20;
     }
+    const ULONGLONG deadline = GetTickCount64() + 30000;
     ConnectSettings->sock = INVALID_SOCKET;
     for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
         closesocket(ConnectSettings->sock);
@@ -54,9 +55,11 @@ int EstablishSocketConnection(pConnectSettings ConnectSettings, LPCSTR connectto
         SetBlockingSocket(ConnectSettings->sock, false);
         connected = connect(ConnectSettings->sock, ai->ai_addr, (int)ai->ai_addrlen) == 0;
         if (!connected && WSAGetLastError() == WSAEWOULDBLOCK) {
-            while (true) {
+            while (GetTickCount64() < deadline) {
                 if (IsSocketWritable(ConnectSettings->sock)) {
-                    connected = true;
+                    int error = 0; int length = sizeof(error);
+                    connected = getsockopt(ConnectSettings->sock, SOL_SOCKET, SO_ERROR,
+                        reinterpret_cast<char*>(&error), &length) == 0 && error == 0;
                     break;
                 }
                 if (IsSocketError(ConnectSettings->sock))

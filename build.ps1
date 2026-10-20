@@ -11,7 +11,7 @@ param(
 # ============================================================================
 $projectName = "SFTPplug"
 $projectRoot = $PSScriptRoot
-$binDir = Join-Path $projectRoot "bin"
+$binDir = Join-Path $projectRoot "build\out"
 $buildDir = Join-Path $projectRoot "build"
 $buildOutputDir    = Join-Path $buildDir "bin\x64_Release"
 $buildOutputDirX86 = Join-Path $buildDir "bin\Win32_Release"
@@ -20,7 +20,7 @@ $helpProject = Join-Path $projectRoot "src\help\sftpplug.hhp"
 $helpCompiled = Join-Path $projectRoot "src\help\sftpplug.chm"
 
 # Read plugin version from version.h (single source of truth)
-$pluginVersion = "10.1.0.0"
+$pluginVersion = $null
 $verHPath = Join-Path $projectRoot "src\include\version.h"
 if (Test-Path $verHPath) {
     $verHContent = Get-Content $verHPath -Raw
@@ -28,6 +28,8 @@ if (Test-Path $verHPath) {
         $pluginVersion = $matches[1]
     }
 }
+
+if (-not $pluginVersion) { throw "Plugin version was not found in src/include/version.h" }
 
 # ============================================================================
 # Helper Functions
@@ -115,8 +117,13 @@ function Remove-PathSafe {
     if (-not (Test-Path $PathToRemove)) {
         return $true
     }
+    $resolved = [IO.Path]::GetFullPath($PathToRemove)
+    $allowedRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot 'build')) + '\'
+    if (-not $resolved.StartsWith($allowedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Cleanup target must be inside the build directory"
+    }
     try {
-        Remove-Item $PathToRemove -Recurse -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction Stop
         return $true
     } catch {
         Write-Host "  Warning: could not remove $PathToRemove" -ForegroundColor Yellow
@@ -236,7 +243,7 @@ if (-not (Test-Path $vswhere)) {
     exit 1
 }
 
-$vsPath = &$vswhere -latest -prerelease -requires Microsoft.Component.MSBuild -property installationPath
+$vsPath = &$vswhere -latest -prerelease -products * -requires Microsoft.Component.MSBuild -property installationPath
 if (-not $vsPath) {
     Write-Error "Visual Studio Build Tools not found."
     exit 1
@@ -272,10 +279,6 @@ if ($vcToolsVersion) {
 Write-Host ""
 Write-Host "--- Preparing Build Directories ---" -ForegroundColor Cyan
 
-# Clean bin directory (only final output)
-if (-not (Remove-PathSafe -PathToRemove $binDir)) {
-    Write-Host "  Continuing with existing bin directory" -ForegroundColor Yellow
-}
 New-Item -ItemType Directory -Path $binDir -Force | Out-Null
 
 # Clean build output directory
@@ -357,7 +360,7 @@ if (-not $nozip) {
     Write-Host ""
     Write-Host "--- Creating ZIP Package ---" -ForegroundColor Cyan
     
-    $zipPath = Join-Path $binDir "$projectName.zip"
+    $zipPath = Join-Path $binDir ("${projectName}_v${pluginVersion}.zip")
     $pluginstInf = @"
 [plugininstall]
 description=Secure FTP plugin (x64+x86) - static build, no external DLL required
@@ -377,6 +380,7 @@ version=$pluginVersion
 
     function Add-ZipFile([string]$src, [string]$entryName) {
         $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+        $entry.LastWriteTime = [DateTimeOffset]::UtcNow
         $dst = $entry.Open()
         $fs  = [System.IO.File]::OpenRead($src)
         try   { $fs.CopyTo($dst) }
@@ -385,6 +389,7 @@ version=$pluginVersion
 
     function Add-ZipString([string]$text, [string]$entryName) {
         $entry = $zip.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+        $entry.LastWriteTime = [DateTimeOffset]::UtcNow
         $dst = $entry.Open()
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($text)
         try   { $dst.Write($bytes, 0, $bytes.Length) }
@@ -395,6 +400,12 @@ version=$pluginVersion
         Add-ZipFile  (Join-Path $buildOutputDir    "$projectName.wfx") "$projectName.wfx64"
         Add-ZipFile  (Join-Path $buildOutputDirX86 "$projectName.wfx") "$projectName.wfx"
         Add-ZipString $pluginstInf "pluginst.inf"
+        Add-ZipFile (Join-Path $projectRoot 'LICENSE.md') 'LICENSE.md'
+        Add-ZipFile (Join-Path $projectRoot 'THIRD-PARTY-NOTICES.md') 'THIRD-PARTY-NOTICES.md'
+        Add-ZipFile (Join-Path $projectRoot 'thirdparty/libssh2/COPYING') 'licenses/libssh2-COPYING.txt'
+        Add-ZipFile (Join-Path $projectRoot 'thirdparty/mbedtls/LICENSE') 'licenses/MbedTLS-LICENSE.txt'
+        Add-ZipFile (Join-Path $projectRoot 'licenses/Argon2-LICENSE.txt') 'licenses/Argon2-LICENSE.txt'
+        Add-ZipFile (Join-Path $projectRoot 'release.txt') 'changelog.txt'
 
         if (Test-Path $phpAgentSource) { Add-ZipFile $phpAgentSource "sftp.php" }
         if (Test-Path $helpCompiled)   { Add-ZipFile $helpCompiled   "$projectName.chm" }
@@ -411,14 +422,9 @@ version=$pluginVersion
         $readmeSource = Join-Path $projectRoot "src\help\readme.txt"
         if (Test-Path $readmeSource)   { Add-ZipFile $readmeSource   "readme.txt" }
 
-        # Set a future timestamp on the ZIP — signature of a static, dependency-free build
-        $futureDate = [DateTime]"2030-01-01 00:00:00"
-        (Get-Item $zipPath).LastWriteTime   = $futureDate
-        (Get-Item $zipPath).CreationTime    = $futureDate
-        (Get-Item $zipPath).LastAccessTime  = $futureDate
-        Write-Host "  Created: $projectName.zip (dated $($futureDate.ToString('yyyy-MM-dd')))" -ForegroundColor Green
+        Write-Host "  Created: $zipPath" -ForegroundColor Green
     } catch {
-        Write-Host "  Failed to create ZIP: $($_.Exception.Message)" -ForegroundColor Red
+        throw
     } finally {
         $zip.Dispose()
         $outStream.Dispose()
@@ -485,14 +491,9 @@ if (-not $nodeploy) {
 }
 
 # ============================================================================
-# Step 7: Clean up intermediate build directory
+# Step 7: Build outputs are retained for verification.
 # ============================================================================
-$buildBinDir = Join-Path $buildDir "bin"
-if (Test-Path $buildBinDir) {
-    Remove-Item $buildBinDir -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-# ============================================================================
+#
 # Step 8: Final Summary
 # ============================================================================
 Write-Host ""

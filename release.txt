@@ -1,5 +1,30 @@
 # Release Notes
 
+## SFTPplug 10.2.5.1
+
+- Extended Skip all to local write errors and general download failures during batch copying.
+- Kept cancellation, overwrite decisions, moves, and resumed transfers under normal error handling.
+- Preserved pre-existing destination files and logged incomplete files that could not be removed without interrupting Skip all.
+
+## SFTPplug 10.2.5.0
+
+- Fixed text-mode download buffer expansion and ANSI filename conversion.
+- Fixed truncated path handling, PHP path normalization, upload finalization, and validation of partial uploads before resuming.
+- Added LAN3 authentication with random challenge salts, derived trust keys, and authenticated frames for commands, replies, and file data.
+- Restricted LAN donors to explicitly selected shared folders and applied donor passwords and TrustedInstaller settings before listening.
+- Fixed LAN donor role actions and interrupted idle connections during server shutdown.
+- Required PHP signature version 2 covering the request target and body, and removed bearer authentication fallback.
+- Restricted PHP filesystem operations and TAR extraction to the exported root, protected root deletion, and moved replay storage outside that root.
+- Disabled PHP shell execution by default and constrained its working directory.
+- Added bounded TAR metadata parsing, checksum validation, PAX/base-256 handling, and explicit ustar size-limit errors.
+- Added SHA256 SSH host fingerprints, Unicode WFX callbacks, PPK MAC verification and Argon2 resource limits.
+- Fixed impersonation cleanup, restored temporary privilege changes, and removed silent password-encryption fallback.
+- Corrected build-tool discovery, enabled compiler stack protection, retained compiler diagnostics, and updated packaging and third-party notices.
+
+Compatibility: LAN peers must be updated together and paired again. PHP deployments must use the matching agent. Existing agent credentials are supported through signature-key derivation.
+
+---
+
 ## SFTPplug 10.2.1.2
 
 - Fixed corrupted LAN Pair downloads when resuming an existing partial file. Remaining data is now written at the requested absolute offset.

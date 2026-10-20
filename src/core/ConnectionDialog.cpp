@@ -1,4 +1,5 @@
 // Connection dialog/UI extracted from SftpConnection.cpp
+#include <shlobj.h>
 #include "global.h"
 #include <windows.h>
 #include <commctrl.h>
@@ -9,6 +10,9 @@
 
 // Declared in SftpConnection.cpp
 extern void LanFileServerSetTrustedInstaller(bool enabled);
+extern void LanFileServerSetPassword(const std::string&);
+extern void LanFileServerSetRoot(const std::string&);
+extern void StartGlobalLanServices(bool);
 #include <new>
 #include <unordered_map>
 #include <vector>
@@ -836,148 +840,41 @@ static void HandleLanPairAction(HWND hWnd, ConnectDialogContext* dlgCtx, pConnec
 
     EnsureLanDiscoveryRunning(hWnd, dlgCtx, s);
 
-    std::array<wchar_t, MAX_PATH> passW{};
+    std::array<wchar_t, 4096> passW{};
     GetDlgItemTextW(hWnd, IDC_PASSWORD, passW.data(), static_cast<int>(passW.size() - 1));
-    // Empty password is allowed in TOFU mode (trust-on-first-use).
+    // A donor needs a password; receivers may reconnect using saved trust.
 
     const int roleIdx = (int)SendDlgItemMessage(hWnd, IDC_SYSTEM, CB_GETCURSEL, 0, 0);
     int role = LanRoleComboToValue(roleIdx);
 
-    auto startReceiver = [&](bool allowStopToggle) -> bool {
-        if (!dlgCtx->lanServer) {
-            dlgCtx->lanServer = std::make_unique<lanpair::PairServer>();
-        }
-        if (dlgCtx->lanServerRunning) {
-            if (allowStopToggle) {
-                dlgCtx->lanServer->stop();
-                dlgCtx->lanServerRunning = false;
-                const std::wstring s = LoadResStringW(IDS_LAN_MSG_RECEIVER_STOPPED);
-                ShowStatusW(s.empty() ? L"LAN Pair receiver stopped." : s.c_str());
-            } else {
-                const std::wstring s = LoadResStringW(IDS_LAN_MSG_RECEIVER_RUNNING);
-                ShowStatusW(s.empty() ? L"LAN Pair receiver already running." : s.c_str());
-            }
-            return true;
-        }
-
-        lanpair::PairServerConfig cfg{};
-        cfg.port = 45846;
-        cfg.peerId = dlgCtx->lanPeerId;
-        cfg.displayName = WideToUtf8(dlgCtx->lanDisplayName);
-        cfg.role = lanpair::PairRole::Receiver;
-        cfg.password = WideToUtf8(passW.data());
-        lanpair::PairError err{};
-        const std::wstring acceptedTempl = LoadResStringW(IDS_LAN_MSG_ACCEPTED);
-        const bool ok = dlgCtx->lanServer->start(
-            cfg,
-            [acceptedTempl](const lanpair::PairSessionInfo& info) {
-                std::wstring peerW(info.remotePeerId.begin(), info.remotePeerId.end());
-                std::wstring ipW(info.remoteIp.begin(), info.remoteIp.end());
-                const std::wstring msg = acceptedTempl.empty()
-                    ? L"LAN Pair accepted: " + peerW + L" (" + ipW + L")"
-                    : FormatBracesW(acceptedTempl, { std::wstring_view(peerW), std::wstring_view(ipW) });
-                ShowStatusW(msg.c_str());
-            },
-            &err);
-        if (!ok) {
-            WindowsUserFeedback tempFeedback(hWnd);
-            std::wstring msgTemplW = LoadResStringW(IDS_LAN_ERR_RECEIVER_START);
-            if (msgTemplW.empty()) msgTemplW = L"Receiver start failed: {}";
-            std::wstring errW(err.message.begin(), err.message.end());
-            const std::wstring msgW = FormatBracesW(msgTemplW, { std::wstring_view(errW) });
-            const std::wstring titleW = LoadResStringW(IDS_LAN_TITLE);
-            tempFeedback.ShowError(WideToUtf8(msgW), titleW.empty() ? "LAN Pair" : WideToUtf8(titleW));
+    auto startReceiver = [&](bool) -> bool {
+        const std::string password = WideToUtf8(passW.data());
+        if (password.empty()) {
+            MessageBoxW(hWnd, L"Set a pairing password before starting the donor.", L"LAN Pair", MB_OK | MB_ICONWARNING);
             return false;
         }
-        dlgCtx->lanServerRunning = true;
-        {
-            const std::wstring s = LoadResStringW(IDS_LAN_MSG_RECEIVER_STARTED);
-            ShowStatusW(s.empty() ? L"LAN Pair receiver started." : s.c_str());
-        }
+        BROWSEINFOW browse{};
+        browse.hwndOwner = hWnd;
+        browse.lpszTitle = L"Select the folder shared by this donor";
+        browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
+        if (!item) return false;
+        std::array<wchar_t, MAX_PATH> folder{};
+        const bool selected = SHGetPathFromIDListW(item, folder.data()) != FALSE;
+        CoTaskMemFree(item);
+        if (!selected) return false;
+        s->lan_pair_root = WideToUtf8(folder.data());
+        LanFileServerSetPassword(password);
+        LanFileServerSetRoot(s->lan_pair_root);
+        LanFileServerSetTrustedInstaller(s->lan_pair_trusted_installer);
+        StartGlobalLanServices(true);
+        ShowStatusW(L"LAN Pair donor started; waiting for a receiver.");
         return true;
     };
 
-    if (role == 0) {
-        startReceiver(false);
+    if (role == 0 && !startReceiver(false)) return;
 
-        // Capture which peers are already known before the dialog opens.
-        std::vector<std::string> peersBefore;
-        peersBefore.reserve(dlgCtx->lanPeers.size());
-        for (const auto& [id, _] : dlgCtx->lanPeers)
-            peersBefore.push_back(id);
-
-        PairingProgressParams params{};
-        params.ctx = dlgCtx;
-        params.peerCountBefore = dlgCtx->lanPeers.size();
-
-        dlgCtx->lanPairingActive = true;
-        ShowLocalizedDialogBoxParam(IDD_PAIRING_PROGRESS, hWnd, PairingProgressDlgProc,
-            reinterpret_cast<LPARAM>(&params));
-        dlgCtx->lanPairingActive = false;
-
-        if (!IsWindow(hWnd))
-            return;
-
-        if (params.peerFound) {
-            // Find the first peer that appeared while the dialog was open.
-            std::string newPeerId;
-            for (const auto& [id, _] : dlgCtx->lanPeers) {
-                if (std::find(peersBefore.begin(), peersBefore.end(), id) == peersBefore.end()) {
-                    newPeerId = id;
-                    break;
-                }
-            }
-            if (!newPeerId.empty()) {
-                RefreshLanPeerCombo(hWnd, dlgCtx, newPeerId);
-
-                const std::wstring titleW = LoadResStringW(IDS_LAN_TITLE);
-                const std::wstring msgW = LoadResStringW(IDS_LAN_ROLE_PROMPT);
-                const int choice = MessageBoxW(
-                    hWnd,
-                    msgW.empty() ? L"LAN Pair peer found.\nSelect role:\n\nYes = Donor\nNo = Receiver\nCancel = no change" : msgW.c_str(),
-                    titleW.empty() ? L"LAN Pair" : titleW.c_str(),
-                    MB_ICONQUESTION | MB_YESNOCANCEL | MB_DEFBUTTON1);
-
-                if (!IsWindow(hWnd))
-                    return;
-
-                if (choice == IDYES) {
-                    SendDlgItemMessage(hWnd, IDC_SYSTEM, CB_SETCURSEL, 2, 0);
-                    for (size_t i = 0; i < dlgCtx->lanPeerOrder.size(); ++i) {
-                        if (dlgCtx->lanPeerOrder[i] == newPeerId) {
-                            SendDlgItemMessage(hWnd, IDC_UTF8, CB_SETCURSEL,
-                                static_cast<WPARAM>(i + 1), 0);
-                            break;
-                        }
-                    }
-                    HandleLanPairAction(hWnd, dlgCtx, s);
-                } else if (choice == IDNO) {
-                    SendDlgItemMessage(hWnd, IDC_SYSTEM, CB_SETCURSEL, 1, 0);
-                    const std::wstring startedW = LoadResStringW(IDS_LAN_MSG_RECEIVER_STARTED);
-                    ShowStatusW(startedW.empty() ? L"LAN Pair receiver started." : startedW.c_str());
-                } else {
-                    // User cancelled role selection — stop the receiver we started.
-                    if (dlgCtx->lanServer && dlgCtx->lanServerRunning) {
-                        dlgCtx->lanServer->stop();
-                        dlgCtx->lanServerRunning = false;
-                        const std::wstring stoppedW = LoadResStringW(IDS_LAN_MSG_RECEIVER_STOPPED);
-                        ShowStatusW(stoppedW.empty() ? L"LAN Pair receiver stopped." : stoppedW.c_str());
-                    }
-                }
-            }
-        } else {
-            // Timeout or user cancelled — stop the receiver.
-            if (dlgCtx->lanServer && dlgCtx->lanServerRunning) {
-                dlgCtx->lanServer->stop();
-                dlgCtx->lanServerRunning = false;
-            }
-            const std::wstring timeoutW = LoadResStringW(IDS_PAIRING_TIMEOUT);
-            ShowStatusW(timeoutW.empty() ? L"LAN Pair: no peer found." : timeoutW.c_str());
-        }
-        return;
-    }
-
-    if (role == 1) {
+    if (role == 2) {
         startReceiver(true);
         return;
     }
@@ -1709,7 +1606,7 @@ INT_PTR WINAPI ProxyDlgProc(HWND hWnd, UINT Message, WPARAM wParam, LPARAM lPara
 
             strlcat(proxyentry.data(), "$$pass", proxyentry.size()-1);
 
-            std::array<char, MAX_PATH> proxyPassword{};
+            std::array<char, 4096> proxyPassword{};
             if (CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_LOAD_PASSWORD_NO_UI, proxyentry.data(), proxyPassword.data(), static_cast<int>(proxyPassword.size() - 1)) == FS_FILE_OK) {
                 ConnectData.proxypassword = proxyPassword.data();
                 SetDlgItemText(hWnd, IDC_PROXYPASSWORD, ConnectData.proxypassword);
@@ -1775,7 +1672,7 @@ INT_PTR WINAPI ProxyDlgProc(HWND hWnd, UINT Message, WPARAM wParam, LPARAM lPara
             LPSTR proxy_str = (ConnectData.proxytype == sftp::Proxy::notused) ? nullptr : buf.data();
             WritePrivateProfileString(proxyentry.data(), "proxytype", proxy_str, ctx->iniFileName);
 
-            std::array<char, 1024> szEncryptedPassword{};
+            std::array<char, 8192> szEncryptedPassword{};
             if (!IsWindowVisible(GetDlgItem(hWnd, IDC_EDITPASS))) {  // Edit button is hidden.
                 if (ConnectData.proxypassword.empty()) {
                     WritePrivateProfileString(proxyentry.data(), "proxypassword", nullptr, ctx->iniFileName);
@@ -1788,7 +1685,7 @@ INT_PTR WINAPI ProxyDlgProc(HWND hWnd, UINT Message, WPARAM wParam, LPARAM lPara
                     CryptCheckPass = true;
                 } else {
                     EncryptString(ConnectData.proxypassword.c_str(), szEncryptedPassword.data(), static_cast<UINT>(szEncryptedPassword.size()));
-                    WritePrivateProfileString(proxyentry.data(), "proxypassword", szEncryptedPassword.data(), ctx->iniFileName);
+                    if (szEncryptedPassword[0]) WritePrivateProfileString(proxyentry.data(), "proxypassword", szEncryptedPassword.data(), ctx->iniFileName);
                 }
             }
             
@@ -1837,7 +1734,7 @@ INT_PTR WINAPI ProxyDlgProc(HWND hWnd, UINT Message, WPARAM wParam, LPARAM lPara
 
             strlcat(proxyentry.data(), "$$pass", proxyentry.size()-1);
 
-            std::array<char, MAX_PATH> proxyPassword{};
+            std::array<char, 4096> proxyPassword{};
             err = CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_LOAD_PASSWORD, proxyentry.data(), proxyPassword.data(), static_cast<int>(proxyPassword.size() - 1));
             if (err == FS_FILE_OK) {
                 ConnectData.proxypassword = proxyPassword.data();
@@ -2702,6 +2599,7 @@ void ConnectionDialog::OnOk()
         WritePrivateProfileString(targetProfile.data(), "phptar", m_settings->php_tar ? "1" : nullptr, dlgIniFileName);
         _itoa_s(max(0, min(2, m_settings->lan_pair_role)), buf.data(), buf.size(), 10);
         WritePrivateProfileString(targetProfile.data(), "lanpairrole", m_settings->lan_pair_role == 0 ? nullptr : buf.data(), dlgIniFileName);
+        WritePrivateProfileString(targetProfile.data(), "lanpairroot", m_settings->lan_pair_root.c_str(), dlgIniFileName);
         WritePrivateProfileString(targetProfile.data(), "lanpairpeer", m_settings->lan_pair_peer.empty() ? nullptr : m_settings->lan_pair_peer.c_str(), dlgIniFileName);
         _itoa_s(max(0, m_settings->lan_pair_timeout_min), buf.data(), buf.size(), 10);
         WritePrivateProfileString(targetProfile.data(), "lanpairtimeout", m_settings->lan_pair_timeout_min == 0 ? nullptr : buf.data(), dlgIniFileName);
@@ -2754,7 +2652,7 @@ void ConnectionDialog::OnOk()
         _itoa_s(m_settings->proxynr, buf.data(), buf.size(), 10);
         WritePrivateProfileString(targetProfile.data(), TEXT("proxynr"), buf.data(), dlgIniFileName);
 
-        std::array<char, 1024> szEncryptedPassword{};
+        std::array<char, 8192> szEncryptedPassword{};
         if (!IsWindowVisible(GetDlgItem(m_hWnd, IDC_EDITPASS))) {
             if (m_settings->password.empty()) {
                 WritePrivateProfileString(targetProfile.data(), "password", nullptr, dlgIniFileName);
@@ -2767,7 +2665,7 @@ void ConnectionDialog::OnOk()
             } else {
                 EncryptString(m_settings->password.c_str(), szEncryptedPassword.data(),
                               static_cast<UINT>(szEncryptedPassword.size()));
-                WritePrivateProfileString(targetProfile.data(), "password", szEncryptedPassword.data(), dlgIniFileName);
+                if (szEncryptedPassword[0]) WritePrivateProfileString(targetProfile.data(), "password", szEncryptedPassword.data(), dlgIniFileName);
             }
         }
 
@@ -2982,7 +2880,7 @@ bool ShowConnectDialog(pConnectSettings ConnectSettings, LPCSTR DisplayName, LPC
                 std::wstring titleW = LoadResStringW(IDS_PROXY_PASS_TITLE);
                 std::string titleStr = WideToUtf8(titleW.empty() ? L"Proxy password for " : titleW);
                 titleStr += ConnectSettings->proxyuser;
-                std::array<char, MAX_PATH> proxyPassword{};
+                std::array<char, 4096> proxyPassword{};
                 if (!RequestProc(PluginNumber, RT_PasswordFirewall, titleStr.c_str(), titleStr.c_str(), proxyPassword.data(), static_cast<int>(proxyPassword.size() - 1)))
                     return false;
                 ConnectSettings->proxypassword = proxyPassword.data();
@@ -3030,7 +2928,7 @@ pConnectSettings SftpConnectToServer(LPCSTR DisplayName, LPCSTR inifilename, LPC
         }
         if (CryptProc && ConnectSettings.password == "\001") {
             ConnectSettings.passSaveMode = sftp::PassSaveMode::crypt;
-            std::array<char, MAX_PATH> passwordBuf{};
+            std::array<char, 4096> passwordBuf{};
             int rc = CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_LOAD_PASSWORD, DisplayName, passwordBuf.data(), static_cast<int>(passwordBuf.size() - 1));
             if (rc != FS_FILE_OK) {
                 ConnectSettings.feedback->ShowError(LngStrU8(IDS_ERR_LOAD_PASS, "Failed to load password!"));
@@ -3046,7 +2944,7 @@ pConnectSettings SftpConnectToServer(LPCSTR DisplayName, LPCSTR inifilename, LPC
                 strlcpy(proxyentry.data(), "proxy", proxyentry.size()-1);
 
             strlcat(proxyentry.data(), "$$pass", proxyentry.size()-1);
-            std::array<char, MAX_PATH> proxyPasswordBuf{};
+            std::array<char, 4096> proxyPasswordBuf{};
             int rc = CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_LOAD_PASSWORD, proxyentry.data(), proxyPasswordBuf.data(), static_cast<int>(proxyPasswordBuf.size() - 1));
             if (rc != FS_FILE_OK) {
                 ConnectSettings.feedback->ShowError(LngStrU8(IDS_ERR_LOAD_PROXY_PASS, "Failed to load proxy password!"));

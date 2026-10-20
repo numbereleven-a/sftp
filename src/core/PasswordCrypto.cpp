@@ -144,6 +144,7 @@ void EncryptString(LPCTSTR pszPlain, LPTSTR pszEncrypted, UINT cchEncrypted)
         return;
 
     std::string plain(pszPlain);
+    struct Wipe { std::string& value; ~Wipe() { SecureZeroMemory(value.data(), value.size()); } } wipe{plain};
 
     // Try DPAPI first
     DataBlob blob;
@@ -158,10 +159,8 @@ void EncryptString(LPCTSTR pszPlain, LPTSTR pszEncrypted, UINT cchEncrypted)
         }
     }
 
-    // Fallback: XOR obfuscation (same format as legacy passwords — numeric triplets)
-    const std::string result = LegacyEncryptXor(plain);
-    if (result.size() < cchEncrypted)
-        strcpy(pszEncrypted, result.c_str());
+    MessageBoxW(nullptr, L"The password could not be protected. It was not saved.",
+                L"SFTP", MB_OK | MB_ICONERROR);
 }
 
 void DecryptString(LPCTSTR pszEncrypted, LPTSTR pszPlain, UINT cchPlain)

@@ -19,6 +19,10 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <map>
+#include <set>
+#include <memory>
+#include <algorithm>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -354,14 +358,165 @@ inline bool setSocketTimeout(SOCKET s, DWORD ms) {
                       reinterpret_cast<const char*>(&ms), sizeof(ms)) == 0;
 }
 
-inline bool sendAll(SOCKET s, const uint8_t* data, size_t len) {
+inline std::mutex cancellationMutex;
+inline std::set<SOCKET> cancelledSockets;
+inline bool socketCancelled(SOCKET s) {
+    std::lock_guard<std::mutex> lock(cancellationMutex);
+    return cancelledSockets.contains(s);
+}
+inline void cancelSocket(SOCKET s) {
+    std::lock_guard<std::mutex> lock(cancellationMutex);
+    cancelledSockets.insert(s);
+    shutdown(s, SD_BOTH);
+}
+inline void resetSocketCancellation(SOCKET s) {
+    std::lock_guard<std::mutex> lock(cancellationMutex);
+    cancelledSockets.erase(s);
+}
+inline bool waitSocket(SOCKET s, bool writing, ULONGLONG deadline) {
+    while (!socketCancelled(s) && GetTickCount64() < deadline) {
+        fd_set set; FD_ZERO(&set); FD_SET(s, &set);
+        timeval timeout{0, 100000};
+        const int result = select(0, writing ? nullptr : &set, writing ? &set : nullptr, nullptr, &timeout);
+        if (result > 0) return true;
+        if (result == SOCKET_ERROR) return false;
+    }
+    return false;
+}
+
+inline bool rawSendAll(SOCKET s, const uint8_t* data, size_t len) {
+    u_long nonblocking = 1; ioctlsocket(s, FIONBIO, &nonblocking);
     size_t sent = 0;
+    DWORD timeout = 300000; int optionLength = sizeof(timeout);
+    getsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeout), &optionLength);
+    if (!timeout) timeout = 300000;
+    const ULONGLONG deadline = GetTickCount64() + timeout;
     while (sent < len) {
+        if (!waitSocket(s, true, deadline)) return false;
         const int n = send(s,
                            reinterpret_cast<const char*>(data + sent),
-                           static_cast<int>(len - sent), 0);
+                           static_cast<int>(std::min<size_t>(len - sent, 65536)), 0);
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
         if (n <= 0) return false;
         sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+inline bool rawRecvAll(SOCKET s, uint8_t* data, size_t len) {
+    u_long nonblocking = 1; ioctlsocket(s, FIONBIO, &nonblocking);
+    size_t got = 0;
+    DWORD timeout = 300000; int optionLength = sizeof(timeout);
+    getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), &optionLength);
+    if (!timeout) timeout = 300000;
+    const ULONGLONG deadline = GetTickCount64() + timeout;
+    while (got < len) {
+        if (!waitSocket(s, false, deadline)) return false;
+        const int n = recv(s, reinterpret_cast<char*>(data + got),
+                           static_cast<int>(std::min<size_t>(len - got, 65536)), 0);
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+        if (n <= 0) return false;
+        got += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+inline bool constantTimeEqual(std::span<const uint8_t> a, std::span<const uint8_t> b) {
+    if (a.size() != b.size()) return false;
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) diff = static_cast<uint8_t>(diff | (a[i] ^ b[i]));
+    return diff == 0;
+}
+
+inline bool verifyHexMac(const std::optional<std::vector<uint8_t>>& expected,
+                         const std::string& supplied) {
+    auto decoded = hexDecode(supplied);
+    return expected && decoded && constantTimeEqual(*expected, *decoded);
+}
+
+// LAN3 authenticates every frame, including responses and file bytes. The
+// session key is challenge-bound and directional keys prevent reflection.
+struct LanChannel {
+    std::vector<uint8_t> txKey, rxKey, pending;
+    size_t pendingOffset = 0;
+    uint64_t txSequence = 0, rxSequence = 0;
+};
+inline std::mutex channelsMutex;
+inline std::map<SOCKET, std::shared_ptr<LanChannel>> channels;
+
+inline std::shared_ptr<LanChannel> channelFor(SOCKET s) {
+    std::lock_guard<std::mutex> lock(channelsMutex);
+    auto it = channels.find(s);
+    return it == channels.end() ? nullptr : it->second;
+}
+
+inline bool secureSocket(SOCKET s, const std::vector<uint8_t>& key, bool server) {
+    auto derive = [&](const char* label) {
+        return hmacSha256(key, std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(label), strlen(label)));
+    };
+    auto c2s = derive("LAN3 client to server"), s2c = derive("LAN3 server to client");
+    if (!c2s || !s2c) return false;
+    auto channel = std::make_shared<LanChannel>();
+    channel->txKey = server ? *s2c : *c2s;
+    channel->rxKey = server ? *c2s : *s2c;
+    std::lock_guard<std::mutex> lock(channelsMutex);
+    channels[s] = std::move(channel);
+    return true;
+}
+
+inline void closeSocket(SOCKET s) {
+    { std::lock_guard<std::mutex> lock(channelsMutex); channels.erase(s); }
+    closesocket(s);
+    resetSocketCancellation(s);
+}
+
+inline bool sendAll(SOCKET s, const uint8_t* data, size_t len) {
+    auto channel = channelFor(s);
+    if (!channel) return rawSendAll(s, data, len);
+    while (len) {
+        const size_t n = std::min<size_t>(len, 65536);
+        std::vector<uint8_t> frame(12 + n);
+        const uint32_t size = htonl(static_cast<uint32_t>(n));
+        memcpy(frame.data(), &size, 4);
+        for (size_t i = 0; i < 8; ++i)
+            frame[4 + i] = static_cast<uint8_t>(channel->txSequence >> ((7 - i) * 8));
+        memcpy(frame.data() + 12, data, n);
+        auto mac = hmacSha256(channel->txKey, frame);
+        if (!mac || !rawSendAll(s, frame.data(), frame.size()) ||
+            !rawSendAll(s, mac->data(), mac->size())) return false;
+        ++channel->txSequence;
+        data += n; len -= n;
+    }
+    return true;
+}
+
+inline bool receiveBytes(SOCKET s, uint8_t* data, size_t len) {
+    auto channel = channelFor(s);
+    if (!channel) return rawRecvAll(s, data, len);
+    while (len) {
+        if (channel->pendingOffset == channel->pending.size()) {
+            std::array<uint8_t, 12> header{};
+            if (!rawRecvAll(s, header.data(), header.size())) return false;
+            uint32_t size; memcpy(&size, header.data(), 4); size = ntohl(size);
+            uint64_t sequence = 0;
+            for (size_t i = 4; i < 12; ++i) sequence = (sequence << 8) | header[i];
+            if (!size || size > 65536 || sequence != channel->rxSequence) return false;
+            std::vector<uint8_t> frame(header.begin(), header.end());
+            frame.resize(12 + size);
+            std::array<uint8_t, 32> supplied{};
+            if (!rawRecvAll(s, frame.data() + 12, size) ||
+                !rawRecvAll(s, supplied.data(), supplied.size())) return false;
+            auto expected = hmacSha256(channel->rxKey, frame);
+            if (!expected || !constantTimeEqual(*expected, supplied)) return false;
+            channel->pending.assign(frame.begin() + 12, frame.end());
+            channel->pendingOffset = 0;
+            ++channel->rxSequence;
+        }
+        const size_t n = (std::min)(len, channel->pending.size() - channel->pendingOffset);
+        memcpy(data, channel->pending.data() + channel->pendingOffset, n);
+        channel->pendingOffset += n;
+        data += n; len -= n;
     }
     return true;
 }
@@ -369,9 +524,12 @@ inline bool sendAll(SOCKET s, const uint8_t* data, size_t len) {
 inline bool recvLine(SOCKET s, std::string* out, size_t maxLen = 4096) {
     out->clear();
     char c = 0;
+    DWORD timeout = 300000; int optionLength = sizeof(timeout);
+    getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), &optionLength);
+    const ULONGLONG deadline = GetTickCount64() + (timeout ? timeout : 300000);
     while (out->size() < maxLen) {
-        const int n = recv(s, &c, 1, 0);
-        if (n <= 0)    return false;
+        if (GetTickCount64() >= deadline || socketCancelled(s)) return false;
+        if (!receiveBytes(s, reinterpret_cast<uint8_t*>(&c), 1)) return false;
         if (c == '\n') return true;
         if (c != '\r') out->push_back(c);
     }

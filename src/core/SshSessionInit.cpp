@@ -1,5 +1,7 @@
 #include "global.h"
+#include "global.h"
 #include <windows.h>
+#include "HostFingerprint.h"
 #include <cerrno>
 #include <array>
 #include <memory>
@@ -120,7 +122,9 @@ int InitializeSshSession(
     progress = 40; // PROG_SESSION_STARTUP
     LoadStr(buf, IDS_SESSION_STARTUP);
     int auth;
+    const ULONGLONG deadline = GetTickCount64() + 30000;
     while ((auth = ConnectSettings->session->startup((int)ConnectSettings->sock)) == LIBSSH2_ERROR_EAGAIN) {
+        if (GetTickCount64() >= deadline) { auth = LIBSSH2_ERROR_TIMEOUT; break; }
         if (ProgressLoop(buf.data(), progress, progress + 20, &loop, &lasttime))
             break;
         WaitForTransportReadable(ConnectSettings);
@@ -143,18 +147,18 @@ int InitializeSshSession(
 
 int VerifyServerFingerprint(pConnectSettings ConnectSettings)
 {
-    LPCSTR fingerprint = ConnectSettings->session->hostkeyHash(LIBSSH2_HOSTKEY_HASH_MD5);
-    if (fingerprint == nullptr) {
-        SftpLogLastError("Fingerprint error: ", ConnectSettings->session->lastErrno());
-        return -90;
+    const std::string fingerprintHex = Sha256HostFingerprint(ConnectSettings->session.get());
+    if (fingerprintHex.empty()) return -90;
+    const std::string endpoint = ConnectSettings->server + ":" + std::to_string(ConnectSettings->customport);
+    std::array<char, 1024> savedEndpoint{};
+    GetPrivateProfileString(ConnectSettings->DisplayName.c_str(), "fingerprinthost", "",
+        savedEndpoint.data(), static_cast<DWORD>(savedEndpoint.size()), ConnectSettings->IniFileName.c_str());
+    if (savedEndpoint[0] && endpoint != savedEndpoint.data()) {
+        if (ConnectSettings->feedback) ConnectSettings->feedback->ShowError("The saved host key belongs to a different host or port.");
+        return -100;
     }
-    ShowStatusId(IDS_SERVER_FINGERPRINT, nullptr, true);
-    std::string fingerprintHex;
-    fingerprintHex.reserve(16 * 3);
-    for (size_t i = 0; i < 16; i++) {
-        if (i > 0) fingerprintHex += ' ';
-        fingerprintHex += std::format("{:02X}", static_cast<unsigned char>(fingerprint[i]));
-    }
+    const bool legacyMatch = MatchesLegacyFingerprint(ConnectSettings->session.get(), ConnectSettings->savedfingerprint);
+    if (legacyMatch) ConnectSettings->savedfingerprint.clear();
     ShowStatus(fingerprintHex.c_str());
 
     if (ConnectSettings->savedfingerprint != fingerprintHex) {
@@ -167,17 +171,21 @@ int VerifyServerFingerprint(pConnectSettings ConnectSettings)
         LoadStr(msg2, IDS_FINGERPRINT);
         const std::string prompt = std::string(msg1.data()) + msg2.data() + fingerprintHex;
 
-        bool verified = false;
-        if (ConnectSettings->feedback) {
+        if (!ConnectSettings->savedfingerprint.empty()) {
+            if (ConnectSettings->feedback) ConnectSettings->feedback->ShowError(prompt.c_str());
+            return -100;
+        }
+        bool verified = legacyMatch;
+        if (!verified && ConnectSettings->feedback) {
             verified = ConnectSettings->feedback->AskYesNo(prompt.c_str(), "SFTP Security Warning");
-        } else {
-            verified = false;
         }
 
         if (!verified)
             return -100;
 
         WritePrivateProfileString(ConnectSettings->DisplayName.c_str(), "fingerprint", fingerprintHex.c_str(), ConnectSettings->IniFileName.c_str());
+        WritePrivateProfileString(ConnectSettings->DisplayName.c_str(), "fingerprinthost",
+            endpoint.c_str(), ConnectSettings->IniFileName.c_str());
         ConnectSettings->savedfingerprint = fingerprintHex;
     }
     return 0;

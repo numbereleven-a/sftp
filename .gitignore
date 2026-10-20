@@ -83,3 +83,14 @@ thirdparty/libssh2/libssh2.pc.in
 # Archiwa lokalne
 *.7z
 *.tar.gz
+
+# Local build and test output
+build/bin/
+build/.intermediates/
+build/out/
+build/*.obj
+build/*.exe
+build/*.log
+tests/build/
+
+/bin/*.zip

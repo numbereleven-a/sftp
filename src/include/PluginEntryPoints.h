@@ -38,7 +38,8 @@ LANGID GetConfiguredUiLanguageId() noexcept;
 // download callback sequence and stored independently for each transfer thread.
 void BeginDownloadErrorBatch() noexcept;
 void EndDownloadErrorBatch() noexcept;
-int HandleBatchDownloadReadError(LPCWSTR remoteName, LPCWSTR localName,
-                                bool move, bool requestedResume);
+int HandleBatchDownloadError(LPCWSTR remoteName, LPCWSTR localName,
+                            bool move, bool requestedResume,
+                            int error = FS_FILE_READERROR, bool removePartial = true);
 
 

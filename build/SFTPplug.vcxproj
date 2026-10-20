@@ -73,7 +73,7 @@
       <Optimization>Disabled</Optimization>
       <InlineFunctionExpansion>Disabled</InlineFunctionExpansion>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
-      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <DebugInformationFormat>None</DebugInformationFormat>
       <AdditionalIncludeDirectories>..\src\include;..\src\lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_DEBUG;SFTP_ALLINONE;LIBSSH2_MBEDTLS;LIBSSH2_STATIC;LIBSSH2_API=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
@@ -81,7 +81,7 @@
       <ConformanceMode>true</ConformanceMode>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <WarningLevel>Level3</WarningLevel>
-      <DisableSpecificWarnings>4018;4244;4267;4834;4996;26812;26451</DisableSpecificWarnings>
+      <DisableSpecificWarnings>4996;26812;26451</DisableSpecificWarnings>
       <AdditionalOptions>/Zc:gotoScope- /Zc:strictStrings- /Brepro %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ResourceCompile>
@@ -90,7 +90,7 @@
     </ResourceCompile>
     <Link>
       <LinkTimeCodeGeneration>Default</LinkTimeCodeGeneration>
-      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
       <AdditionalDependencies>crypt32.lib;bcrypt.lib;winhttp.lib;ws2_32.lib;iphlpapi.lib;shlwapi.lib;user32.lib;gdi32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4017 /ignore:4099 /BREPRO /PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
@@ -100,7 +100,9 @@
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <ControlFlowGuard>Guard</ControlFlowGuard>
+      <DebugInformationFormat>None</DebugInformationFormat>
       <AdditionalIncludeDirectories>..\src\include;..\src\lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>NDEBUG;SFTP_ALLINONE;LIBSSH2_MBEDTLS;LIBSSH2_STATIC;LIBSSH2_API=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -108,7 +110,7 @@
       <ConformanceMode>true</ConformanceMode>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <WarningLevel>Level3</WarningLevel>
-      <DisableSpecificWarnings>4018;4244;4267;4834;4996;26812;26451</DisableSpecificWarnings>
+      <DisableSpecificWarnings>4996;26812;26451</DisableSpecificWarnings>
       <AdditionalOptions>/Zc:gotoScope- /Zc:strictStrings- /Brepro %(AdditionalOptions)</AdditionalOptions>
       <Optimization>MaxSpeed</Optimization>
       <IntrinsicFunctions>true</IntrinsicFunctions>
@@ -120,7 +122,7 @@
     </ResourceCompile>
     <Link>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
-      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>..\php\deps\lib;..\src\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>crypt32.lib;bcrypt.lib;winhttp.lib;ws2_32.lib;iphlpapi.lib;shlwapi.lib;user32.lib;gdi32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -148,7 +150,6 @@
   <ItemGroup>
     <ClCompile Include="..\src\core\UnicodeHelpers.cpp" />
     <ClCompile Include="..\src\core\UtfConversion.cpp" />
-    <ClCompile Include="..\src\core\FtpDirectoryParser.cpp" />
     <ClCompile Include="..\src\core\ServerRegistry.cpp" />
     <ClCompile Include="..\src\core\SftpConnection.cpp" />
     <ClCompile Include="..\src\core\ProxyNegotiator.cpp" />
@@ -159,6 +160,7 @@
     <ClCompile Include="..\src\core\ShellFallbackTransfer.cpp" />
     <ClCompile Include="..\src\core\SftpTransfer.cpp" />
     <ClCompile Include="..\src\core\TransferUtils.cpp" />
+    <ClCompile Include="..\src\core\TextConversion.cpp" />
     <ClCompile Include="..\src\core\SftpRemoteOps.cpp" />
     <ClCompile Include="..\src\core\SftpShell.cpp" />
     <ClCompile Include="..\src\core\Libssh2Backend.cpp" />

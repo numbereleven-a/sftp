@@ -9,50 +9,9 @@
 
 struct CrLfState { bool pendingCr = false; int64_t total = 0; };
 
-static void CountCrLfToLf(const char* data, size_t len, bool& pendingCr, int64_t& total)
-{
-    size_t kept = 0;
-    size_t i = 0;
-    if (pendingCr) {
-        pendingCr = false;
-        ++kept;
-        if (len > 0 && data[0] == '\n') { i = 1; }
-    }
-    for (; i < len; ++i) {
-        if (data[i] == '\r' && i + 1 < len && data[i + 1] == '\n') continue;
-        if (data[i] == '\r' && i + 1 == len) { pendingCr = true; continue; }
-        ++kept;
-    }
-    total += static_cast<int64_t>(kept);
-}
+void CountCrLfToLf(const char*, size_t, bool&, int64_t&);
 
-static size_t CrLfToLfStateful(const char* in, size_t len, char* out, bool& pendingCr)
-{
-    size_t o = 0;
-    size_t i = 0;
-    if (pendingCr) {
-        pendingCr = false;
-        if (len > 0 && in[0] == '\n') {
-            out[o++] = '\n';
-            i = 1;
-        } else {
-            out[o++] = '\r';
-        }
-    }
-    for (; i < len; ++i) {
-        const char ch = in[i];
-        if (ch == '\r') {
-            if (i + 1 < len) {
-                if (in[i + 1] == '\n') continue;
-            } else {
-                pendingCr = true;
-                continue;
-            }
-        }
-        out[o++] = ch;
-    }
-    return o;
-}
+size_t CrLfToLfStateful(const char*, size_t, char*, bool&);
 
 // Reference: whole-buffer conversion (no chunking).
 static std::string RefConvert(const std::string& in) {
@@ -97,7 +56,17 @@ static void RunCase(const std::string& content, size_t chunkSize) {
     }
 }
 
+int ConvertCrToCrLf(char*, size_t, size_t, bool*);
 int main() {
+    {
+        std::vector<char> buffer(120001, '\n');
+        buffer.back() = 'X';
+        bool state = false;
+        if (ConvertCrToCrLf(buffer.data(), 60000, 120000, &state) != 120000 || buffer.back() != 'X') ++failures;
+        std::fill(buffer.begin(), buffer.end(), '\n');
+        state = false;
+        if (ConvertCrToCrLf(buffer.data(), 60000, 60000, &state) != -1 || buffer[60000] != '\n') ++failures;
+    }
     const char* contents[] = {
         "a\r\nb\r\nc",
         "\r\nstart",

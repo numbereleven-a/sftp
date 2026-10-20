@@ -186,16 +186,12 @@ void copyfinddatawa(LPWIN32_FIND_DATA lpFindFileDataA, LPWIN32_FIND_DATAW lpFind
 {
     if (!lpFindFileDataA || !lpFindFileDataW) return;
     
-    // Convert WCHAR arrays to CHAR arrays
-    for (size_t i = 0; i < _countof(lpFindFileDataA->cFileName) - 1 && i < _countof(lpFindFileDataW->cFileName); ++i) {
-        lpFindFileDataA->cFileName[i] = static_cast<char>(lpFindFileDataW->cFileName[i] & 0xFF);
-    }
-    lpFindFileDataA->cFileName[_countof(lpFindFileDataA->cFileName) - 1] = '\0';
-    
-    for (size_t i = 0; i < _countof(lpFindFileDataA->cAlternateFileName) - 1 && i < _countof(lpFindFileDataW->cAlternateFileName); ++i) {
-        lpFindFileDataA->cAlternateFileName[i] = static_cast<char>(lpFindFileDataW->cAlternateFileName[i] & 0xFF);
-    }
-    lpFindFileDataA->cAlternateFileName[_countof(lpFindFileDataA->cAlternateFileName) - 1] = '\0';
+    // ANSI WFX callbacks use the Windows ANSI code page, independently of
+    // the remote connection's encoding (already decoded into UTF-16).
+    walcopy(lpFindFileDataA->cFileName, lpFindFileDataW->cFileName,
+            _countof(lpFindFileDataA->cFileName));
+    walcopy(lpFindFileDataA->cAlternateFileName, lpFindFileDataW->cAlternateFileName,
+            _countof(lpFindFileDataA->cAlternateFileName));
     
     lpFindFileDataA->dwFileAttributes = lpFindFileDataW->dwFileAttributes;
     lpFindFileDataA->ftCreationTime = lpFindFileDataW->ftCreationTime;
@@ -211,17 +207,11 @@ void copyfinddataaw(LPWIN32_FIND_DATAW lpFindFileDataW, LPWIN32_FIND_DATA lpFind
 {
     if (!lpFindFileDataW || !lpFindFileDataA) return;
     
-    // Convert CHAR arrays to WCHAR arrays
-    for (size_t i = 0; i < _countof(lpFindFileDataW->cFileName) - 1 && i < _countof(lpFindFileDataA->cFileName); ++i) {
-        lpFindFileDataW->cFileName[i] = static_cast<wchar_t>(static_cast<unsigned char>(lpFindFileDataA->cFileName[i]));
-    }
-    lpFindFileDataW->cFileName[_countof(lpFindFileDataW->cFileName) - 1] = L'\0';
-    
-    for (size_t i = 0; i < _countof(lpFindFileDataW->cAlternateFileName) - 1 && i < _countof(lpFindFileDataA->cAlternateFileName); ++i) {
-        lpFindFileDataW->cAlternateFileName[i] = static_cast<wchar_t>(static_cast<unsigned char>(lpFindFileDataA->cAlternateFileName[i]));
-    }
-    lpFindFileDataW->cAlternateFileName[_countof(lpFindFileDataW->cAlternateFileName) - 1] = L'\0';
-    
+    awlcopy(lpFindFileDataW->cFileName, lpFindFileDataA->cFileName,
+            _countof(lpFindFileDataW->cFileName));
+    awlcopy(lpFindFileDataW->cAlternateFileName, lpFindFileDataA->cAlternateFileName,
+            _countof(lpFindFileDataW->cAlternateFileName));
+
     lpFindFileDataW->dwFileAttributes = lpFindFileDataA->dwFileAttributes;
     lpFindFileDataW->ftCreationTime = lpFindFileDataA->ftCreationTime;
     lpFindFileDataW->ftLastAccessTime = lpFindFileDataA->ftLastAccessTime;

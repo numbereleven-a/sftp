@@ -68,7 +68,8 @@ int main(int argc, char** argv) {
                 sendLine(peer, mode == "upload-ok" ? "DONE" : mode == "upload-spaces" ? "   " : "");
         } else {
             requestOk = request.ends_with(" " + std::to_string(initial.size()));
-            sendLine(peer, "OK " + std::to_string(remainder.size()));
+            sendLine(peer, mode == "invalid-negative" ? "OK -1" : mode == "invalid-text" ? "OK junk" :
+                           "OK " + std::to_string(remainder.size()));
             sendAll(peer, reinterpret_cast<const uint8_t*>(remainder.data()), remainder.size());
         }
         shutdown(peer, SD_SEND);
@@ -84,7 +85,9 @@ int main(int argc, char** argv) {
         const bool received = session.getFile("/synthetic", file.c_str(), 6, nullptr, true, !fresh, &result);
         std::ifstream input(file, std::ios::binary);
         std::string contents((std::istreambuf_iterator<char>(input)), {});
-        ok = received && result == FS_FILE_OK && contents == "ABCDEF";
+        ok = mode.starts_with("invalid-") ?
+            !received && result == FS_FILE_READERROR && contents == initial :
+            received && result == FS_FILE_OK && contents == "ABCDEF";
         std::cout << "Expected size 6, actual size " << contents.size() << '\n';
     }
     server.join();

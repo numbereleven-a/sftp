@@ -256,7 +256,6 @@ HANDLE WINAPI FsFindFirstW(LPCWSTR Path, LPWIN32_FIND_DATAW FindData)
             return CreateLastFindHandle(ok ? sftpdataptr : nullptr, serverid, false);
         }
         if (!ok) {
-            if (!wasconnected) freportconnect = false;
             // newConnGuard destructor fires: SetServerIdForName(name, nullptr) → close + delete
             SetLastError(ERROR_PATH_NOT_FOUND);
             return INVALID_HANDLE_VALUE;
@@ -380,7 +379,8 @@ BOOL WINAPI FsMkDirW(LPCWSTR Path)
     sftp::DllExceptionBarrier _barrier;
     return sftp::dll_invoke(_barrier, FALSE, [&]() -> BOOL {
         const std::wstring_view pathView = Path ? std::wstring_view(Path) : std::wstring_view{};
-        if (pathView.size() < 2)
+        if (pathView.size() < 2 || pathView.front() != L'\\' ||
+            (pathView.size() > 1 && pathView[1] == L'\\'))
             return false;
 
         const bool hasRemoteSubPath = pathView.find(L'\\', 1) != std::wstring_view::npos;

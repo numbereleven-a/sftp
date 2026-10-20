@@ -130,10 +130,12 @@ struct tConnectSettings {
     bool php_tar = false;          // TAR streaming for directory downloads (PHP Agent only)
     bool php_agent_hmac = false;   // PROBE auth.hmac_auth: agent verifies HMAC signatures (legacy header optional)
     int lan_pair_role;         // 0=auto, 1=receiver, 2=donor
+    std::string lan_pair_root; // Explicit donor share selected in the connection dialog.
     std::string lan_pair_peer; // peerId of the remote machine (set during pairing)
     std::string lan_pair_ip;   // current IP of remote peer (found by discovery)
     uint16_t lan_pair_port = 45846; // TCP port of remote peer's file server
     int lan_pair_timeout_min = 0;         // 0=no limit
+    std::string php_auth_salt;
     bool lan_pair_trusted_installer = false; // impersonate NT SERVICE\TrustedInstaller on connect
     std::unique_ptr<LanPairSession> lanSession; // active file session (nullptr when disconnected)
 
@@ -186,7 +188,7 @@ int  SftpDownloadFileW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, LPC
 int  SftpUploadFileW(pConnectSettings ConnectSettings, LPCWSTR LocalName, LPCWSTR RemoteName, bool Resume, bool setattr);
 int  SftpDeleteFileW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, bool isdir);
 int  SftpSetAttr(pConnectSettings ConnectSettings, LPCSTR RemoteName, int NewAttr);
-int  SftpSetDateTimeW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, LPFILETIME LastWriteTime);
+int  SftpSetDateTimeW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, LPFILETIME LastWriteTime, LPFILETIME LastAccessTime = nullptr);
 void SftpGetLastActivePathW(pConnectSettings ConnectSettings, LPWSTR RelativePath, size_t maxlen);
 bool SftpChmodW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, LPCWSTR chmod);
 bool SftpLinkFolderTargetW(pConnectSettings ConnectSettings, LPWSTR RemoteName, size_t maxlen);

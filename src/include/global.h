@@ -14,8 +14,8 @@
 #define _WINSOCKAPI_
 
 // Modern Windows SDK headers
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #include <BaseTsd.h>
 #include <stdlib.h>

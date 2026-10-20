@@ -1,5 +1,6 @@
 #include "LanPair.h"
 #include "LanPairInternal.h"
+#include "LanPairAuth.h"
 #include "DllExceptionBarrier.h"
 
 #include <winsock2.h>
@@ -142,8 +143,8 @@ struct DiscoveryService::Impl {
     std::unordered_map<std::string, PeerAnnouncement> peers;
 
     void closeSockets() {
-        if (txSock != INVALID_SOCKET) { closesocket(txSock); txSock = INVALID_SOCKET; }
-        if (rxSock != INVALID_SOCKET) { closesocket(rxSock); rxSock = INVALID_SOCKET; }
+        if (txSock != INVALID_SOCKET) { closeSocket(txSock); txSock = INVALID_SOCKET; }
+        if (rxSock != INVALID_SOCKET) { closeSocket(rxSock); rxSock = INVALID_SOCKET; }
     }
 
     std::string buildAnnouncement() const {
@@ -217,7 +218,7 @@ struct DiscoveryService::Impl {
                                    sizeof(bcastAddr));
                             sentAny = true;
                         }
-                        closesocket(sock);
+                        closeSocket(sock);
                     }
                 }
             }
@@ -354,131 +355,13 @@ struct PairServer::Impl {
 
     void closeListen() {
         if (listenSock != INVALID_SOCKET) {
-            closesocket(listenSock);
+            closeSocket(listenSock);
             listenSock = INVALID_SOCKET;
         }
     }
 
     bool authenticateClient(SOCKET s, PairSessionInfo* info) {
-        std::string line;
-        if (!recvLine(s, &line)) return false;
-
-        const auto hello = splitBySpace(line);
-        if (hello.size() != 5 || hello[0] != "PAIR1" || hello[1] != "HELLO")
-            return false;
-
-        const std::string clientPeerId    = hello[2];
-        const PairRole    clientRole      = roleFromString(hello[3]);
-        const auto        clientNonceHex  = hello[4];
-        const auto        clientNonce     = hexDecode(clientNonceHex);
-        if (!clientNonce || clientNonce->size() != kNonceSize) return false;
-
-        std::array<uint8_t, kSaltSize>  salt{};
-        std::array<uint8_t, kNonceSize> serverNonce{};
-        if (!randomBytes(salt.data(), salt.size()) ||
-            !randomBytes(serverNonce.data(), serverNonce.size()))
-            return false;
-
-        std::ostringstream ch;
-        ch << "PAIR1 CHALLENGE "
-           << cfg.peerId << " "
-           << escapeToken(cfg.displayName) << " "
-           << roleToString(cfg.role) << " "
-           << hexEncode(salt.data(), salt.size()) << " "
-           << hexEncode(serverNonce.data(), serverNonce.size());
-
-        if (!sendLine(s, ch.str())) return false;
-        if (!recvLine(s, &line))    return false;
-
-        const auto auth = splitBySpace(line);
-        std::vector<uint8_t> key;
-        std::string issuedTrustHex;
-
-        const std::string material = "C|" + clientNonceHex + "|" +
-            hexEncode(serverNonce.data(), serverNonce.size()) + "|" +
-            clientPeerId + "|" + cfg.peerId;
-        const std::string materialSrv = "S|" + clientNonceHex + "|" +
-            hexEncode(serverNonce.data(), serverNonce.size()) + "|" +
-            clientPeerId + "|" + cfg.peerId;
-
-        if (!cfg.password.empty()) {
-            if (auth.size() != 3 || auth[0] != "PAIR1" || auth[1] != "AUTH")
-                return false;
-
-            std::string combined;
-            if (clientPeerId < cfg.peerId)
-                combined = clientPeerId + "<>" + cfg.peerId;
-            else
-                combined = cfg.peerId + "<>" + clientPeerId;
-            std::vector<uint8_t> derivedSalt(16, 0);
-            auto h = hmacSha256(
-                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("LANPAIR"), 7),
-                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(combined.data()), combined.size()));
-            if (h && h->size() >= 16) {
-                for (size_t i = 0; i < 16; ++i) derivedSalt[i] = (*h)[i];
-            } else {
-                memcpy(derivedSalt.data(), "sftpplug-pair...", 16);
-            }
-            const auto derived = deriveKeyPbkdf2(cfg.password, std::span<const uint8_t>(derivedSalt.data(), derivedSalt.size()), kDerivedKeySize);
-
-            if (!derived) return false;
-            key = *derived;
-            const auto expected = hmacSha256(key,
-                std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(material.data()), material.size()));
-            if (!expected) return false;
-            if (hexEncode(expected->data(), expected->size()) != auth[2]) {
-                sendLine(s, "PAIR1 FAIL bad-auth");
-                return false;
-            }
-        } else {
-            const std::string trustKey = trustKeyForServer(cfg.peerId, clientPeerId);
-            std::string storedSecret;
-            const bool haveTrust = DpapiSecretStore::loadSecret(trustKey, &storedSecret, nullptr);
-            if (haveTrust) {
-                if (auth.size() != 3 || auth[0] != "PAIR1" || auth[1] != "AUTH")
-                    return false;
-                key.assign(storedSecret.begin(), storedSecret.end());
-                const auto expected = hmacSha256(key,
-                    std::span<const uint8_t>(
-                        reinterpret_cast<const uint8_t*>(material.data()), material.size()));
-                if (!expected) return false;
-                if (hexEncode(expected->data(), expected->size()) != auth[2]) {
-                    sendLine(s, "PAIR1 FAIL bad-trust");
-                    return false;
-                }
-            } else {
-                // SECURITY: first-time pairing without a shared password is
-                // not possible — trust tokens are only issued to a peer that
-                // proves knowledge of the configured password. A bare
-                // "PAIR1 TRUSTNEW" used to hand full filesystem access to ANY
-                // LAN host, so without a password there is nothing to derive
-                // a key from and the request is rejected with a clear reason.
-                sendLine(s, "PAIR1 FAIL trust-required");
-                return false;
-            }
-        }
-
-        const auto serverProof = hmacSha256(key,
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(materialSrv.data()), materialSrv.size()));
-        if (!serverProof) return false;
-
-        std::ostringstream ok;
-        if (!issuedTrustHex.empty()) {
-            ok << "PAIR1 OKTRUST " << hexEncode(serverProof->data(), serverProof->size())
-               << " " << issuedTrustHex;
-        } else {
-            ok << "PAIR1 OK " << hexEncode(serverProof->data(), serverProof->size());
-        }
-        if (!sendLine(s, ok.str())) return false;
-
-        if (info) {
-            info->remotePeerId      = clientPeerId;
-            info->remoteRole        = clientRole;
-            info->remoteDisplayName = clientPeerId;
-        }
-        return true;
+        return authenticatePeerServer(s, cfg.peerId, cfg.password, info);
     }
 
     void runAcceptLoop() {
@@ -498,7 +381,7 @@ struct PairServer::Impl {
             info.remoteIp = ip;
 
             const bool ok = authenticateClient(client, &info);
-            closesocket(client);
+            closeSocket(client);
 
             if (ok && onAccepted) onAccepted(info);
         }
@@ -592,193 +475,23 @@ bool PairClient::connectAndAuthenticate(const PairClientConfig& cfg,
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(cfg.targetPort);
     if (inet_pton(AF_INET, cfg.targetIp.c_str(), &addr.sin_addr) != 1) {
-        closesocket(s);
+        closeSocket(s);
         setErr(err, ERROR_INVALID_ADDRESS, "Invalid target IP");
         return false;
     }
 
     if (connect(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
         const int code = WSAGetLastError();
-        closesocket(s);
+        closeSocket(s);
         setErr(err, code, "Cannot connect to target peer");
         return false;
     }
 
-    std::array<uint8_t, kNonceSize> clientNonce{};
-    if (!randomBytes(clientNonce.data(), clientNonce.size())) {
-        closesocket(s);
-        setErr(err, GetLastError(), "Cannot generate client nonce");
-        return false;
-    }
-    const std::string clientNonceHex = hexEncode(clientNonce.data(), clientNonce.size());
-
-    std::ostringstream hello;
-    hello << "PAIR1 HELLO " << cfg.peerId << " "
-          << roleToString(cfg.role) << " " << clientNonceHex;
-    if (!sendLine(s, hello.str())) {
-        closesocket(s);
-        setErr(err, WSAGetLastError(), "Cannot send hello");
-        return false;
-    }
-
-    std::string line;
-    if (!recvLine(s, &line)) {
-        closesocket(s);
-        setErr(err, WSAGetLastError(), "No challenge received");
-        return false;
-    }
-
-    const auto ch = splitBySpace(line);
-    if (ch.size() != 7 || ch[0] != "PAIR1" || ch[1] != "CHALLENGE") {
-        closesocket(s);
-        setErr(err, ERROR_INVALID_DATA, "Invalid challenge format");
-        return false;
-    }
-
-    const std::string serverPeerId      = ch[2];
-    const std::string serverDisplayName = unescapeToken(ch[3]);
-    const PairRole    serverRole        = roleFromString(ch[4]);
-    const auto        salt              = hexDecode(ch[5]);
-    const auto        serverNonce       = hexDecode(ch[6]);
-
-    if (!salt || !serverNonce ||
-        salt->size() != kSaltSize || serverNonce->size() != kNonceSize) {
-        closesocket(s);
-        setErr(err, ERROR_INVALID_DATA, "Invalid challenge nonce/salt");
-        return false;
-    }
-
-    std::vector<uint8_t> key;
-    const std::string proofMaterial    = "C|" + clientNonceHex + "|" + ch[6] + "|" + cfg.peerId + "|" + serverPeerId;
-    const std::string serverProofMaterial = "S|" + clientNonceHex + "|" + ch[6] + "|" + cfg.peerId + "|" + serverPeerId;
-
-    if (!cfg.password.empty()) {
-        std::string combined;
-        if (cfg.peerId < serverPeerId)
-            combined = cfg.peerId + "<>" + serverPeerId;
-        else
-            combined = serverPeerId + "<>" + cfg.peerId;
-        std::vector<uint8_t> derivedSalt(16, 0);
-        auto h = hmacSha256(
-            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("LANPAIR"), 7),
-            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(combined.data()), combined.size()));
-        if (h && h->size() >= 16) {
-            for (size_t i = 0; i < 16; ++i) derivedSalt[i] = (*h)[i];
-        } else {
-            memcpy(derivedSalt.data(), "sftpplug-pair...", 16);
-        }
-        const auto derived = deriveKeyPbkdf2(cfg.password, std::span<const uint8_t>(derivedSalt.data(), derivedSalt.size()), kDerivedKeySize);
-        if (!derived) {
-            closesocket(s);
-            setErr(err, ERROR_INVALID_DATA, "PBKDF2 failed");
-            return false;
-        }
-        key = *derived;
-        const auto proof = hmacSha256(key,
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(proofMaterial.data()), proofMaterial.size()));
-        if (!proof) {
-            closesocket(s);
-            setErr(err, ERROR_INVALID_DATA, "Cannot compute client proof");
-            return false;
-        }
-        std::ostringstream auth;
-        auth << "PAIR1 AUTH " << hexEncode(proof->data(), proof->size());
-        if (!sendLine(s, auth.str())) {
-            closesocket(s);
-            setErr(err, WSAGetLastError(), "Cannot send auth proof");
-            return false;
-        }
-    } else {
-        std::string trustSecret;
-        const std::string trustKey = trustKeyForClient(serverPeerId, cfg.peerId);
-        const bool haveTrust = DpapiSecretStore::loadSecret(trustKey, &trustSecret, nullptr);
-        if (haveTrust) {
-            key.assign(trustSecret.begin(), trustSecret.end());
-            const auto proof = hmacSha256(key,
-                std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(proofMaterial.data()), proofMaterial.size()));
-            if (!proof) {
-                closesocket(s);
-                setErr(err, ERROR_INVALID_DATA, "Cannot compute trust proof");
-                return false;
-            }
-            std::ostringstream auth;
-            auth << "PAIR1 AUTH " << hexEncode(proof->data(), proof->size());
-            if (!sendLine(s, auth.str())) {
-                closesocket(s);
-                setErr(err, WSAGetLastError(), "Cannot send trust proof");
-                return false;
-            }
-        } else {
-            // SECURITY: servers reject bare TRUSTNEW now. First-time pairing
-            // requires a shared password on both sides.
-            closesocket(s);
-            setErr(err, ERROR_ACCESS_DENIED, "Cannot pair: password required");
-            return false;
-        }
-    }
-
-    if (!recvLine(s, &line)) {
-        closesocket(s);
-        setErr(err, WSAGetLastError(), "No auth response from server");
-        return false;
-    }
-
-    const auto ok = splitBySpace(line);
-    if (ok.size() < 3 || ok[0] != "PAIR1" || (ok[1] != "OK" && ok[1] != "OKTRUST")) {
-        closesocket(s);
-        setErr(err, ERROR_ACCESS_DENIED, "Authentication failed");
-        return false;
-    }
-
-    if (ok[1] == "OKTRUST") {
-        if (ok.size() != 4) {
-            closesocket(s);
-            setErr(err, ERROR_INVALID_DATA, "Invalid trust response");
-            return false;
-        }
-        const auto trustBytes = hexDecode(ok[3]);
-        if (!trustBytes || trustBytes->empty()) {
-            closesocket(s);
-            setErr(err, ERROR_INVALID_DATA, "Invalid trust token");
-            return false;
-        }
-        key.assign(trustBytes->begin(), trustBytes->end());
-    }
-
-    const auto expectedServerProof = hmacSha256(key,
-        std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(serverProofMaterial.data()), serverProofMaterial.size()));
-    if (!expectedServerProof) {
-        closesocket(s);
-        setErr(err, ERROR_INVALID_DATA, "Cannot verify server proof");
-        return false;
-    }
-
-    if (hexEncode(expectedServerProof->data(), expectedServerProof->size()) != ok[2]) {
-        closesocket(s);
-        setErr(err, ERROR_ACCESS_DENIED, "Server proof mismatch");
-        return false;
-    }
-
-    // Persist the trust secret only AFTER the server proof has been verified,
-    // so a failed handshake can never overwrite a working key with garbage.
-    if (ok[1] == "OKTRUST") {
-        const std::string trustKey = trustKeyForClient(serverPeerId, cfg.peerId);
-        std::string raw(reinterpret_cast<const char*>(key.data()), key.size());
-        DpapiSecretStore::saveSecret(trustKey, raw, nullptr);
-    }
-
-    if (outInfo) {
-        outInfo->remotePeerId      = serverPeerId;
-        outInfo->remoteDisplayName = serverDisplayName;
-        outInfo->remoteRole        = serverRole;
-        outInfo->remoteIp          = cfg.targetIp;
-    }
-
-    closesocket(s);
-    return true;
+    const bool ok = authenticatePeerClient(s, cfg.peerId, "", cfg.password, cfg.role, outInfo);
+    if (outInfo) outInfo->remoteIp = cfg.targetIp;
+    if (!ok) setErr(err, ERROR_ACCESS_DENIED, "LAN3 authentication failed; update both peers and pair again.");
+    closeSocket(s);
+    return ok;
 }
 
 namespace DpapiSecretStore {

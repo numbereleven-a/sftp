@@ -4,7 +4,7 @@
 //   * pre-pass : CountCrLfToLf (stateful) + trailing lone CR counted
 //   * loop     : CrLfToLfStateful per read-buffer (cross-chunk CRLF state)
 //   * tail     : trailing lone CR flushed after the loop
-// The two converter functions are copied VERBATIM from src/core/ScpTransfer.cpp.
+// The converter functions are linked from production ScpTransfer.cpp.
 // Checks: declared size == bytes sent, and sent bytes == reference conversion.
 #include <cstdio>
 #include <cstring>
@@ -14,55 +14,10 @@
 #include <cstdint>
 
 // ---- verbatim from ScpTransfer.cpp (CountCrLfToLf) ----
-static void CountCrLfToLf(const char* data, size_t len, bool& pendingCr, int64_t& total)
-{
-    size_t kept = 0;
-    size_t i = 0;
-    if (pendingCr) {
-        pendingCr = false;
-        ++kept;
-        if (len > 0 && data[0] == '\n') { i = 1; }
-    }
-    for (; i < len; ++i) {
-        if (data[i] == '\r' && i + 1 < len && data[i + 1] == '\n')
-            continue;
-        if (data[i] == '\r' && i + 1 == len) {
-            pendingCr = true;
-            continue;
-        }
-        ++kept;
-    }
-    total += static_cast<int64_t>(kept);
-}
+void CountCrLfToLf(const char*, size_t, bool&, int64_t&);
 
 // ---- verbatim from ScpTransfer.cpp (CrLfToLfStateful) ----
-static size_t CrLfToLfStateful(const char* in, size_t len, char* out, bool& pendingCr)
-{
-    size_t o = 0;
-    size_t i = 0;
-    if (pendingCr) {
-        pendingCr = false;
-        if (len > 0 && in[0] == '\n') {
-            out[o++] = '\n';
-            i = 1;
-        } else {
-            out[o++] = '\r';
-        }
-    }
-    for (; i < len; ++i) {
-        const char ch = in[i];
-        if (ch == '\r') {
-            if (i + 1 < len) {
-                if (in[i + 1] == '\n') continue;
-            } else {
-                pendingCr = true;
-                continue;
-            }
-        }
-        out[o++] = ch;
-    }
-    return o;
-}
+size_t CrLfToLfStateful(const char*, size_t, char*, bool&);
 
 // Reference: whole-buffer CRLF->LF (lone CRs preserved).
 static std::string RefConvert(const std::string& in) {

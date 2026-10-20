@@ -1,5 +1,5 @@
 ﻿SFTP Plugin for Total Commander v10.2
-Copyright (C) Marek Wesolowski
+Copyright (C) 2026 Marek Wesolowski - WESMAR
 
 Help:
 - Open sftpplug.chm for full documentation when it is included in the package.

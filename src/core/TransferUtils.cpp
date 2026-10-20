@@ -82,35 +82,6 @@ std::string ToRemotePathA(pConnectSettings cs, LPCWSTR pathW)
     return std::string(tmp.data());
 }
 
-int ConvertCrToCrLf(LPSTR data, size_t len, bool* pLastWasCr)
-{
-    if (!data || !pLastWasCr)
-        return 0;
-
-    bool lastWasCr = *pLastWasCr;
-    std::string result;
-    result.reserve(len + len / 2); // worst case expansion
-
-    for (size_t i = 0; i < len; ++i) {
-        const unsigned char c = static_cast<unsigned char>(data[i]);
-        if (c == '\r') {
-            lastWasCr = true;
-            result.push_back('\r');
-        } else if (c == '\n') {
-            if (!lastWasCr)
-                result.push_back('\r');
-            result.push_back('\n');
-            lastWasCr = false;
-        } else {
-            lastWasCr = false;
-            result.push_back(c);
-        }
-    }
-
-    *pLastWasCr = lastWasCr;
-    memcpy(data, result.data(), result.size());
-    return static_cast<int>(result.size());
-}
 
 bool SftpDetermineTransferModeW(LPCWSTR RemoteName)
 {

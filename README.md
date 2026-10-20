@@ -79,7 +79,7 @@ Complete C-to-C++ rewrite of the original SFTP plugin by Christian Ghisler. Core
 | **Jump Host (ProxyJump)** | Bastion-routed SSH via `direct-tcpip` tunneling. No external `ssh.exe` required. |
 | **PHP Agent (HTTP)** | Standalone HTTP transfer mode backed by a single `sftp.php` file. Supports hosts with no SSH account or blocked subsystem. Directory uploads and batch file downloads transferred as a single TAR stream (opt-in via `php_tar` checkbox). TAR transfers replace thousands of individual HTTP requests with one POST/GET. |
 | **PHP Shell (HTTP)** | Pseudo-terminal over HTTP via `SHELL_EXEC` in `sftp.php`. Persistent command history (Up/Down arrows, 128-entry ring buffer) stored in `%APPDATA%\GHISLER\shell_history.txt`. Maintains working-directory context across requests. |
-| **LAN Pair** | Direct Windows-to-Windows pairing mode. Custom PAIR1 authentication protocol, LAN2 file-transfer command protocol, UDP broadcast peer discovery. |
+| **LAN Pair** | Direct Windows-to-Windows pairing mode. Custom LAN3 authentication and authenticated file-transfer frames, UDP broadcast peer discovery. |
 
 ### Authentication Methods
 
@@ -111,7 +111,6 @@ Complete C-to-C++ rewrite of the original SFTP plugin by Christian Ghisler. Core
 - Optional SSH keepalive for idle SSH sessions (off by default; configurable from the connection dialog or `[Configuration]` in `sftpplug.ini`).
 - Dual-stack IPv4/IPv6 (`getaddrinfo`, `AF_INET6`).
 - Host key fingerprint verification with first-connection warning and change alert.
-- Remote checksum calculation without downloading: MD5, SHA1, SHA256, SHA512.
 - Automatic UTF-8 filename detection via remote `locale` command.
 - Automatic CRLF/LF conversion on text-mode transfers.
 - Symlink tracking including `~` home directory shortcut protection.
@@ -351,18 +350,6 @@ Base64 encoder is self-contained (`ShellB64Encode` / `ShellB64Decode` in `ShellF
 
 Handled in `JumpHostConnection.cpp`. Connects and authenticates to the bastion host, then opens a `direct-tcpip` channel to the final target. The full auth sequence (including PPK, Pageant, keyboard-interactive) runs on the jump host before the tunnel is established. No external `ssh.exe` binary involved.
 
-### Remote Checksums
-
-File integrity verification directly on the server:
-
-| Algorithm | Shell commands tried |
-|-----------|---------------------|
-| MD5 | `md5sum` / `md5 -q` |
-| SHA1 | `sha1sum` / `sha1 -q` |
-| SHA256 | `sha256sum` / `shasum -a 256` |
-| SHA512 | `sha512sum` / `shasum -a 512` |
-
----
 
 ## Authentication System
 
@@ -503,14 +490,16 @@ Implemented in `ProxyNegotiator.cpp`, isolated from the main connection path.
 **Import Features:**
 - Non-conflicting conversion to plugin INI format
 - Preserves connectivity fields (host, port, user, keys)
-- **KiTTY passwords**: automatically decrypted via embedded `dp.exe` (extracted on first use from a CAB resource inside the DLL; Windows Defender path and process exclusion added before extraction via WMI/COM)
+- **KiTTY passwords**: session import uses the in-process KiTTY password decoder.
 - **Checkbox picker dialog** — select any combination of sessions and import in one step
 - **4-path memory** — the last 4 used folder/file paths are remembered and pre-selected on next open
 - **No auto-connect** side effects during import
 
 ### Host Key Verification
 
-MD5 fingerprint stored in INI per server. First connection prompts acceptance. Changed key raises an explicit warning dialog. Both behaviors use the `IUserFeedback` interface so they work correctly in background transfer mode.
+SHA256 fingerprints are stored with the host and port. First connections require acceptance.
+Changed keys are rejected until the saved fingerprint is deliberately updated after verification.
+Matching legacy MD5 entries are migrated to SHA256. Different SSH host-key algorithms have different fingerprints.
 
 ---
 
@@ -531,26 +520,12 @@ Direct Windows-to-Windows file transfer without SSH. Uses a custom application-l
 
 `PeerAnnouncement` fields: `peerId`, `hostName`, `displayName`, `ip`, `tcpPort`, `role` (`Donor` / `Receiver` / `Dual`), `lastSeen`.
 
-### PAIR1 Authentication Protocol
+### LAN3 Authentication
 
-Challenge-response over the TCP socket established after discovery. Wire exchange:
-
-```
-Client → Server:  PAIR1 HELLO <peerId> <role> <clientNonceHex>
-Server → Client:  PAIR1 CHALLENGE <serverNonceHex> <saltHex> <serverPeerId> <displayName> <role> <port>
-Client → Server:  PAIR1 AUTH <proofHex>
-Server → Client:  PAIR1 OK <serverProofHex>
-             or:  PAIR1 OKTRUST <serverProofHex> <issuedTrustHex>
-```
-
-Key derivation for auth proof:
-
-```
-key    = PBKDF2-HMAC-SHA256(password, salt, 120 000 iterations, 32 bytes)
-proof  = HMAC-SHA256(key, clientNonce ‖ serverNonce ‖ "client")
-```
-
-Both client and server verify each other's proof. On first successful connection with password, the server issues a trust token (`OKTRUST`). On subsequent connections, the stored DPAPI trust key is used instead of the password — TOFU (Trust On First Use) model.
+Both peers must run the current LAN3 protocol. Initial pairing requires the same password.
+The donor generates a random PBKDF2 salt and challenge. Both peers verify proofs covering
+the entire handshake, derive a trust key locally, and persist it with DPAPI.
+Trust keys are never sent over the network. Existing older pairings must be recreated.
 
 ### LAN Pair Roles
 
@@ -558,52 +533,42 @@ Both client and server verify each other's proof. On first successful connection
 |------|-----------|----------|
 | **Donor** | `lanpairrole=2` | Starts the local LAN Pair file server; waits for incoming Receiver connections; refuses to initiate outgoing connections. Use on the machine whose files will be accessed remotely. |
 | **Receiver** | `lanpairrole=1` | Does not start a local file server; connects as client to the Donor. Use on the machine that will browse and transfer files. |
-| **Auto** | `lanpairrole=0` | Starts the local file server and shows a guided 60-second pairing wizard. |
+| **Auto** | `lanpairrole=0` | Starts a configured donor and permits connecting to another peer. |
 
-In the **Auto** wizard: **Yes** = connect immediately to the discovered peer (this machine acts as Receiver/client); **No** = stay as server/Donor; **Cancel** = stop server.
 
 ### TrustedInstaller Access
 
 When the **Trusted Installer** checkbox (`lanparti=1`) is enabled:
 
-- **As Donor (server):** incoming connections are served under TrustedInstaller impersonation — the remote Receiver can read, write, delete, and rename files owned by TrustedInstaller on this machine (e.g. files in `C:\Windows\`, Windows Update caches, `WindowsApps`).
+- **As Donor (server):** incoming connections are served under TrustedInstaller impersonation — the remote Receiver can read, write, delete, and rename files owned by TrustedInstaller on this machine (within the explicitly shared folder).
 - **As Receiver (client):** file transfers on this machine run under TI impersonation — allows downloading to TI-protected local directories and uploading from TI-protected local paths.
 
 Impersonation is per-connection (server) or per-transfer (client) and is always reverted after use. Requires `SeDebugPrivilege` (elevated TC). The TrustedInstaller service is started automatically if not already running.
 
 ### DPAPI Trust Key Storage
 
-`DpapiSecretStore` in `LanPair.h` persists trust keys in DPAPI-protected storage keyed by `"lanpair_trust_srv_<serverPeerId>__<clientPeerId>"`. Trust is per peer-pair, per Windows user account. Trust keys are saved with `CRYPTPROTECT_LOCAL_MACHINE` flag for compatibility with TrustedInstaller context. If an old key cannot be decrypted (e.g. after enabling TI), it is deleted automatically and re-pairing is triggered.
+Trust keys are stored separately for each peer pair and protocol version in DPAPI.
+Re-enter the shared password to recreate trust after updating older peers.
 
-### LAN2 Command Protocol
+### LAN3 File Transfer
 
-After PAIR1, the authenticated TCP socket runs the LAN2 line-based command protocol for file operations:
+Commands, responses, directory entries, and file data use authenticated frames.
+Each direction has its own key and increasing sequence number; modified and replayed
+frames are rejected. Authentication protects integrity; this transport does not encrypt file data.
 
-```
-Frame header: magic=0x4B564350 ("KVCP"), version=1, PairCommandType, reserved, payloadSize
-```
-
-`PairCommandType` values: `Handshake`, `ListRoots`, `ListDirectory`, `StartSend`, `StartReceive`, `DataChunk`, `Ack`, `Error`.
-
-`LanPairSession` public API:
-
-```cpp
-static std::unique_ptr<LanPairSession> connect(...) noexcept;
-bool listRoots(std::vector<std::string>& roots) noexcept;
-bool listDirectory(const std::string& path, std::vector<DirEntry>& entries) noexcept;
-bool getFile(const std::string& remotePath, LPCWSTR localPath, ...) noexcept;
-bool putFile(LPCWSTR localPath, const std::string& remotePath, ...) noexcept;
-bool mkdir(const std::string& path) noexcept;
-bool remove(const std::string& path) noexcept;
-bool rename(const std::string& oldPath, const std::string& newPath) noexcept;
-void setTimeoutMin(int minutes) noexcept;
-```
-
-Session timeout configurable via `setTimeoutMin(int minutes)`. When a non-zero timeout is set, every `cmd()` call checks elapsed time via `std::chrono::steady_clock` and closes the session automatically when the limit is reached. All methods are `noexcept`.
-
----
+The donor shares only the folder selected with **Pair**. Paths outside that folder,
+parent traversal, device paths, alternate streams, and reparse points are rejected.
+A donor password and selected folder are required before listening starts.
 
 ## PHP Agent and PHP Shell
+
+Update the plugin and agent together. Requests require signature version 2 covering
+the exact HTTP request target, body digest, timestamp, and nonce. Bearer-only agents
+and older signatures are rejected. Deploy the configured `src/agent/sftp.php`.
+The public PROBE response exposes negotiation fields only. Shell execution is disabled
+by default; enable `AGENT_ALLOW_SHELL` explicitly when required. Shell working directories
+are constrained to the exported root, but enabled shell commands retain the agent process permissions.
+
 
 ### PHP Agent (HTTP)
 
@@ -788,7 +753,6 @@ All operations are available over SFTP, SCP, and PHP Agent modes (where applicab
 | Set attributes (`FsSetAttrW`) | SFTP lstat → RMW write bits → setstat | — | — |
 | Timestamps | SFTP `setstat` | Remote `touch` | — |
 | Symlink resolution | SFTP `realpath` | Parsed from `ls -la` output | — |
-| Remote checksum | Shell command | Shell command | — |
 | File properties | SFTP `stat` | Shell `stat` | Agent `STAT` |
 
 ### Symlink and Tilde Handling
@@ -840,7 +804,6 @@ Remote `locale` command output is parsed to determine the server's character enc
 | `ConnectionAuth.cpp` | Auth method dispatch | Triggers fallback chain |
 | `SessionPostAuth.cpp` | Post-auth session steps (shell, SFTP init) | Separated from auth |
 | `ConnectionDialog.cpp` | Connection dialog and UI handlers | `UpdateCertSectionState` consolidates cert section enable/disable for all transport modes |
-| `ConnectionDialogClass.cpp` | Dialog class and submode handling | |
 | `SftpAuth.cpp` | Auth helpers, key-mode selection | Native PPK-aware |
 | `SftpConnection.cpp` | High-level connection orchestration | Split from legacy monolith |
 | `SftpTransfer.cpp` | Native SFTP transfer path, resume | Streaming buffers; ATTR_SIZE fix |
@@ -850,7 +813,6 @@ Remote `locale` command output is parsed to determine the server's character enc
 | `SftpShell.cpp` | Shell channel execution, EAGAIN guards | |
 | `TransferUtils.cpp` | Progress, rate, shared transfer helpers | |
 | `PhpAgentClient.cpp` | PHP Agent HTTP operations (WinHTTP); TAR batch upload session (`TarUploadSession`, `PhpAgentUploadDirAsTar`); TAR batch download session (`TarDownloadSession`, `PhpAgentDownloadFilesAsTar`, `TAR_PACK`) | |
-| `KittyDecryptDeploy.cpp` | Embeds `dp.exe` as CAB RCDATA resource; deploys on first use via FDI; adds Defender path+process exclusion via WMI/COM before extraction | `KittyDecryptDeploy.h` |
 | `PhpShellConsole.cpp` | PHP Shell pseudo-terminal; keyboard input, Tab completion, Up/Down history navigation | |
 | `ShellHistory.cpp` | Persistent command history — ring buffer (128 entries), atomic NTFS write, `%APPDATA%\GHISLER\shell_history.txt` | `ShellHistory.h` |
 | `PpkConverter.cpp` | PPK v2/v3 → PEM conversion | BCrypt + Argon2; no tools |
@@ -858,11 +820,10 @@ Remote `locale` command output is parsed to determine the server's character enc
 | `SessionImport.cpp` | PuTTY / WinSCP registry + Portable + KiTTY Portable → INI | Non-destructive merge |
 | `ServerRegistry.cpp` | In-memory server profile registry | |
 | `ProfileSettings.cpp` | INI read/write for connection profiles | |
-| `LanPair.cpp` | PAIR1 auth protocol, UDP discovery, PBKDF2 | `namespace smb` |
-| `LanPairSession.cpp` | LAN2 command protocol, file transfer session | `noexcept` public API; session timeout enforcement |
+| `LanPair.cpp` | LAN3 authentication, UDP discovery, PBKDF2 | `namespace smb` |
+| `LanPairSession.cpp` | LAN3 authenticated file protocol, file transfer session | `noexcept` public API; session timeout enforcement |
 | `Libssh2Backend.cpp` | `ISshBackend` implementation over libssh2 | |
 | `AuthMethodParser.cpp` | Parses server-advertised auth method list | |
-| `FtpDirectoryParser.cpp` | `ls -la` output parser | Unicode-aware |
 | `CoreUtils.cpp` | Base64, time conversion, string utilities | Self-contained |
 | `UnicodeHelpers.cpp` / `UtfConversion.cpp` | UTF-8 ↔ wide string conversion | |
 | `WindowsUserFeedback.cpp` | `IUserFeedback` implementation | Decouples UI from logic |
@@ -918,7 +879,7 @@ src/
     DllExceptionBarrier.h      # ABI exception firewall
     ShellHistory.h             # Persistent command history interface
     CoreUtils.h
-    LanPair.h                  # smb:: namespace, PAIR1/LAN2 types
+    LanPair.h                  # smb:: namespace, LAN3 types
     LanPairSession.h
     *.h
     libssh2/
@@ -936,8 +897,6 @@ src/
     sftpplug.rc                # String tables: EN / PL / DE / FR / ES
     resource.h
     icon*.ico
-    kitty-decrypt.cab          # dp.exe packed as LZX CAB (RCDATA resource IDR_KITTY_DECRYPT_CAB)
-build-deps.ps1                 # Builds mbedTLS + libssh2 (x64 + x86, /MT) → src/lib/
 thirdparty/
   mbedtls/                     # mbedTLS 3.6.6 source tree (excluded from git)
     build-x64/                 # (build artifact)
@@ -961,23 +920,12 @@ thirdparty/
 .\build.ps1
 ```
 
-**Single-language builds (smaller binary):**
+**Build options:**
 
-```powershell
-.\build.ps1 -en   # English
-.\build.ps1 -pl   # Polish
-.\build.ps1 -de   # German
-.\build.ps1 -fr   # French
-.\build.ps1 -es   # Spanish
-```
-
-Single-language mode strips unused RC language blocks before compile and restores them afterward. Both x64 and x86 are still built.
-
-**Output after a successful build:**
-- `bin\SFTPplug.zip` — only file remaining in `bin\`; auto-deployed to TC plugin directory
-- ZIP contains both `SFTPplug.wfx64` (x64) and `SFTPplug.wfx` (x86)
-- ZIP file timestamp is set to `2030-01-01 00:00:00` (dependency-free release marker)
-- Intermediate files (`build\bin\`, `build\.intermediates\`) are fully removed
+`-chm`, `-nochm`, `-nodeploy`, `-nozip`, and `-x64only` are supported.
+Use `.\\build.ps1 -nochm -nodeploy` to build without installing.
+All external language files are packaged together.
+The versioned ZIP is written to `build/out/`; intermediate outputs are retained for verification.
 
 **Release configuration:**
 - Standard: `stdcpp20` (C++20), `stdc17` (C17)
@@ -990,20 +938,9 @@ Single-language mode strips unused RC language blocks before compile and restore
 - `SFTP_DEBUG_ENABLED=1` → `OutputDebugString` output
 - `SFTP_DEBUG_TO_FILE=0` by default; set to 1 manually for file logging to `C:\temp\sftpplug_debug.log`
 
-**Rebuilding crypto dependencies (`build-deps.ps1`):**
 
-mbedTLS 3.6.6 and libssh2 1.11.1 can be rebuilt from source under `thirdparty/`:
-
-```powershell
-.\build-deps.ps1                  # Build all (mbedTLS + libssh2, x64 + x86)
-.\build-deps.ps1 -x64only         # x64 only
-.\build-deps.ps1 -x86only         # x86 only
-.\build-deps.ps1 -force           # Rebuild even if .lib files already exist
-```
-
-The script invokes CMake + Ninja under VS18 `vcvars64.bat` / `vcvars32.bat`, builds with `/MT /O2 /Z7`, and copies the resulting `mbedcrypto_{x64,x86}.lib` and `libssh2_{x64,x86}.lib` into `src\lib\`. Public libssh2 headers are synced to `src\include\libssh2\`.
-
-Argon2 static libs (`argon2_a_x64.lib`, `argon2_a_x86.lib`) ship pre-built in `src\lib\` (Argon2 source is not vendored in this repo).
+Static dependency libraries are provided in `src/lib/`.
+See `THIRD-PARTY-NOTICES.md` for their licenses.
 
 ---
 
@@ -1106,10 +1043,9 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 - ISshBackend abstraction layer
 - Native PPK v2/v3 conversion (BCrypt + Argon2, no tools)
 - Shell DD/base64 fallback transfer
-- LAN Pair transport (PAIR1 auth, LAN2 protocol, UDP discovery, DPAPI trust, TOFU)
+- LAN Pair transport (LAN3 authentication and frames, UDP discovery, DPAPI trust)
 - LAN Pair session timeout (configurable, enforced at session level)
 - Session import from PuTTY and WinSCP registry
-- Remote checksum (MD5/SHA1/SHA256/SHA512)
 - SCP >2 GB detection
 - DPAPI + TC Master Password integration
 - SFTP resume fix (`LIBSSH2_SFTP_ATTR_SIZE`)
@@ -1124,7 +1060,7 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 - x64 and x86 packaging — single ZIP with both architectures, TC auto-install via `pluginst.inf`
 - PHP Shell persistent command history — ring buffer (128 entries), atomic NTFS write, `%APPDATA%\GHISLER\shell_history.txt`, `history -c` / `clear history` commands
 - **PuTTY Portable folder import** — auto-finds `putty.reg` recursively; WinSCP.ini portable import
-- **KiTTY Portable import** — auto-finds `Sessions` folder recursively; individual session files (`KeyName\value\` format); only SSH sessions imported; stored passwords decrypted via embedded `dp.exe` (CAB resource, FDI extraction, WMI/COM Defender exclusion) and saved as DPAPI
+- **KiTTY Portable import** — SSH session files and supported stored passwords are imported with in-process decoding and DPAPI storage.
 - **Checkbox session picker** — replaces flat submenus; SysListView32 with LVS_EX_CHECKBOXES; Select All / Deselect All; imports any combination in one step
 - **4-path import memory** — last 4 folder/file paths persisted in `[ImportPaths]` of sftpplug.ini; browse dialog pre-selects last used location
 - **15-language localization** — added CS/HU/NL/PT-BR/RO/SK/UK/JA/ZH-CN; all auto-detected from TC `wincmd.ini` `LanguageIni` setting
@@ -1132,7 +1068,7 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 - **LAN Pair strict roles** — Donor/Receiver/Auto with unidirectional enforcement; Donor starts file server and refuses outgoing connections; Receiver connects as client without starting a local server
 - **LAN Pair TrustedInstaller** — per-connection TI impersonation on the Donor server; per-transfer TI impersonation on the Receiver client; `CRYPTPROTECT_LOCAL_MACHINE` for DPAPI trust keys; auto-delete stale keys + auto-retry on first connect failure
 - **Session delete fix** — single-character session names (e.g. `1`, `2`) can now be deleted via F8/Del
-- **KiTTY password import** — stored KiTTY session passwords decrypted automatically via `dp.exe` (Blowfish/nbcrypt); exe embedded as LZX CAB RCDATA resource, extracted on first use via Windows FDI API; Windows Defender path and process exclusion added before extraction via WMI/COM (`MSFT_MpPreference::Add`, no PowerShell); decrypted password saved as DPAPI
+- **KiTTY password import** — supported stored passwords are decoded in process and saved with DPAPI.
 - **PHP Agent TAR upload** — opt-in `php_tar` checkbox; directory F5 copy streams a single POSIX ustar TAR POST to `op=TAR_EXTRACT`; PHP extracts on-the-fly; GNU LongLink for long paths; two-pass Content-Length; works in foreground (`PUT_MULTI`) and background thread (`PUT_MULTI_THREAD`) modes; plain `.tar` file uploads unaffected
 - **PHP Agent TAR batch download** — opt-in `php_tar` checkbox; multi-file F5 copy sends a single POST to `op=TAR_PACK` with all remote paths; server streams ustar TAR directly without buffering (`php://output`); plugin parses TAR on-the-fly and writes local files; works in foreground (`GET_MULTI`) and background thread (`GET_MULTI_THREAD`) modes; GNU LongLink supported; files >8 GiB skipped cleanly
 - **PHP Agent TAR fixes** — DWORD overflow (TAR upload >4 GB now uses 64-bit `Content-Length` header); TAR pack no longer buffers in `php://temp` on server (eliminates HTTP 504 on OVH); per-file zero-pad allocation removed from upload loop; >8.5 GiB file guard in both C++ and PHP prevents TAR header corruption
@@ -1141,7 +1077,6 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 - **Language filename detection** — UI language is taken from the `.LNG` filename, not from directory-name substrings
 - **SSH keepalive** — optional SSH-level keepalive with a configurable 5–3600 second interval; disabled by default and available for direct SSH/ProxyJump sessions
 - **Bounded non-blocking SSH I/O** — readiness waits now honor libssh2 block directions and ProxyJump streams; libssh2 handles and sessions are closed with bounded EAGAIN cleanup
-- **libssh2 crypto backend migrated WinCNG → mbedTLS 3.6.6** — restores public-key auth against OpenSSH 8.8+/10.x servers (Ubuntu 24.04/26.04 default config). Adds support for `ed25519`, `ECDSA`, `curve25519-sha256`, `AES-GCM`, `mlkem768x25519`. Three local patches against libssh2 1.11.1: (1) `int ret = 0` in `_libssh2_mbedtls_pub_priv_key` (was returning stack garbage); (2) RFC 4251 mpint leading-zero handling in `gen_publickey_from_rsa` (without it, ≈50% of RSA keys produced the wrong on-wire pubkey hash → `PUBLICKEY_UNRECOGNIZED`); (3) RSA-SHA2 default upgrade in `_libssh2_key_sign_algorithm` when `server-sig-algs` is absent. Built statically `/MT` via new `build-deps.ps1`; plugin remains DLL-free
 
 ### In Progress
 
@@ -1161,7 +1096,7 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 
 ---
 
-**Highlights:** Optional SSH keepalive, event-driven SSH/ProxyJump I/O, bounded libssh2 cleanup, DllExceptionBarrier (ABI protection), ConnectionGuard RAII, LAN Pair TOFU/timeout, PHP Shell persistent history, 15-language localization, checkbox session picker with 4-path memory, PuTTY Portable + WinSCP.ini + KiTTY Portable import, **KiTTY password import**, no VC++ Redistributable required
+**Highlights:** Optional SSH keepalive, event-driven SSH/ProxyJump I/O, bounded libssh2 cleanup, DllExceptionBarrier (ABI protection), ConnectionGuard RAII, LAN Pair password pairing and timeout, PHP Shell persistent history, 15-language localization, checkbox session picker with 4-path memory, PuTTY Portable + WinSCP.ini + KiTTY Portable import, **KiTTY password import**, no VC++ Redistributable required
 
 *Secure FTP Plugin — Modern C++20 implementation.*
 *Based on the original SFTP plugin by Christian Ghisler; core modules re-engineered from scratch.*

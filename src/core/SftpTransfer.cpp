@@ -263,7 +263,9 @@ int DownloadLoop(pConnectSettings cs, Handle& remote, LocalFile& local,
             loaded += len;
             int writeLen = len;
             if (textMode) {
-                writeLen = ConvertCrToCrLf(buffer.data(), static_cast<size_t>(len), &lastWasCr);
+                writeLen = ConvertCrToCrLf(buffer.data(), static_cast<size_t>(len), buffer.size(), &lastWasCr);
+                if (writeLen < 0)
+                    return SFTP_READFAILED;
             }
             if (!WriteFile(local.get(), buffer.data(), static_cast<DWORD>(writeLen), &written, nullptr) ||
                 written != static_cast<DWORD>(writeLen)) {

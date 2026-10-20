@@ -18,7 +18,6 @@ extern char    s_f7newconnection[32];
 extern std::array<WCHAR, 32> s_f7newconnectionW;
 extern std::array<WCHAR, 32> s_quickconnectW;
 extern bool    disablereading;
-extern bool    freportconnect;
 
 // Path helpers — defined in PluginEntryPoints.cpp, used across all entry-point TUs.
 pConnectSettings GetServerIdAndRelativePathFromPath(LPCSTR Path, LPSTR RelativePath, size_t maxlen);

@@ -18,7 +18,8 @@ void newpassfunc(LIBSSH2_SESSION* /*session*/, LPSTR* newpw, int* newpw_len, LPV
     pConnectSettings PassConnectSettings = static_cast<pConnectSettings>(*abstract);
     std::array<char, 128> title{};
     std::array<char, 128> buf1{};
-    std::array<char, 128> newpass{};
+    std::array<char, 4096> newpass{};
+    struct WipePassword { std::array<char, 4096>& value; ~WipePassword() { SecureZeroMemory(value.data(), value.size()); } } wipe{newpass};
     LoadStr(title, IDS_PASS_TITLE);
     LoadStr(buf1, IDS_PASS_CHANGE_REQUEST);
     newpass[0] = 0;
@@ -43,9 +44,9 @@ void newpassfunc(LIBSSH2_SESSION* /*session*/, LPSTR* newpw, int* newpw_len, LPV
                 if (newpass[0] == 0) {
                     WritePrivateProfileString(PassConnectSettings->DisplayName.c_str(), "password", nullptr, PassConnectSettings->IniFileName.c_str());
                 } else {
-                    std::array<char, 1024> szEncryptedPassword{};
+                    std::array<char, 8192> szEncryptedPassword{};
                     EncryptString(newpass.data(), szEncryptedPassword.data(), szEncryptedPassword.size());
-                    WritePrivateProfileString(PassConnectSettings->DisplayName.c_str(), "password", szEncryptedPassword.data(), PassConnectSettings->IniFileName.c_str());
+                    if (szEncryptedPassword[0]) WritePrivateProfileString(PassConnectSettings->DisplayName.c_str(), "password", szEncryptedPassword.data(), PassConnectSettings->IniFileName.c_str());
                 }
                 break;
             }

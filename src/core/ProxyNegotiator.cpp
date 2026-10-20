@@ -38,8 +38,12 @@ int SftpConnectProxyHttp(pConnectSettings ConnectSettings, LPCSTR progressbuf, i
         txt = "CONNECT [%s]:%d HTTP/1.1\r\nHost: [%s]:%d\r\n";
     else
         txt = "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n";
-    sprintf_s(buf.data(), buf.size(), txt, server, ConnectSettings->customport, server, ConnectSettings->customport);
+    if (strpbrk(server, "\r\n") || strpbrk(proxyUser, "\r\n") ||
+        _scprintf(txt, server, ConnectSettings->customport, server, ConnectSettings->customport) >= static_cast<int>(buf.size()))
+        return -1;
+    if (sprintf_s(buf.data(), buf.size(), txt, server, ConnectSettings->customport, server, ConnectSettings->customport) < 0) return -1;
     if (!ConnectSettings->proxyuser.empty()) {
+        if (strlen(proxyUser) + strlen(proxyPass) + 2 >= 250) return -1;
         std::array<char, 250> buf1{};
         std::array<char, 500> buf2{};
         std::array<char, 250> title{};
@@ -55,6 +59,7 @@ int SftpConnectProxyHttp(pConnectSettings ConnectSettings, LPCSTR progressbuf, i
         if (passphrase[0] == 0)
             RequestProc(PluginNumber, RT_Password, title.data(), buf1.data(), passphrase.data(), passphrase.size()-1);
 
+        if (strlen(proxyUser) + strlen(passphrase.data()) + 2 >= buf1.size()) return -1;
         strlcpy(buf1.data(), proxyUser, buf1.size()-1);
         strlcat(buf1.data(), ":", buf1.size()-1);
         strlcat(buf1.data(), passphrase.data(), buf1.size()-1);
@@ -111,6 +116,7 @@ int SftpConnectProxySocks4(pConnectSettings ConnectSettings, LPCSTR progressbuf,
     std::array<char, 1024> buf{};
     const char* server = ConnectSettings->server.c_str();
     const char* proxyUser = ConnectSettings->proxyuser.c_str();
+    if (strlen(proxyUser) + strlen(server) + 10 >= buf.size()) return -1;
     ZeroMemory(buf.data(), buf.size());
     buf[0] = SOCKS4_VERSION;
     buf[1] = SOCKS4_CMD_TCP;
@@ -164,10 +170,12 @@ int SftpConnectProxySocks5(pConnectSettings ConnectSettings, int connecttoport, 
     if (ConnectSettings->proxyuser.empty() && buf[1] != 0) {
         *((PBYTE)&buf[1]) = SOCKS5_AUTH_REJECT;
     }
-    if (nrbytes != 2 || buf[0] != SOCKS5_VERSION || buf[1] == SOCKS5_AUTH_REJECT) {
+    if (nrbytes != 2 || buf[0] != SOCKS5_VERSION ||
+        (buf[1] != SOCKS5_AUTH_NONE && buf[1] != SOCKS5_AUTH_USERPASS)) {
         ShowErrorId(IDS_VIA_PROXY_CONNECT);
         return -1;
     }
+    if (strlen(proxyUser) > 255 || strlen(proxyPass) > 255 || strlen(server) > 255) return -1;
     if (buf[1] == 2) { // user/pass auth
         size_t len;
         ZeroMemory(buf.data(), buf.size());

@@ -23,10 +23,6 @@ static std::mutex g_registryMutex;
 static std::vector<std::unique_ptr<SERVERENTRY>> g_servers;
 extern DWORD mainthreadid;
 
-void InitMultiServer() noexcept
-{
-}
-
 void ShutdownMultiServer() noexcept
 {
     FreeServerList();
@@ -107,6 +103,9 @@ bool SetServerIdForName(LPCSTR name, SERVERID id) noexcept
     
     if (old_cs) {
         SftpCloseConnection(old_cs);
+        SecureZeroMemory(old_cs->password.data(), old_cs->password.size());
+        SecureZeroMemory(old_cs->proxypassword.data(), old_cs->proxypassword.size());
+        SecureZeroMemory(old_cs->jump_password.data(), old_cs->jump_password.size());
         delete old_cs;
     }
     
@@ -264,6 +263,9 @@ void FreeServerList() noexcept
     }
     for (auto cs : to_close) {
         SftpCloseConnection(cs);
+        SecureZeroMemory(cs->password.data(), cs->password.size());
+        SecureZeroMemory(cs->proxypassword.data(), cs->proxypassword.size());
+        SecureZeroMemory(cs->jump_password.data(), cs->jump_password.size());
         delete cs;
     }
 }

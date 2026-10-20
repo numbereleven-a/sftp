@@ -3,6 +3,7 @@
 // to the target host, and returns an ITransportStream wrapping that channel.
 // The target SSH session then performs its own handshake over this stream.
 
+#include "HostFingerprint.h"
 #include "global.h"
 #include <windows.h>
 #include <ws2tcpip.h>
@@ -205,24 +206,28 @@ static bool VerifyJumpFingerprint(
     ISshSession*     jmpSession,
     JumpHostSettings& jump)        // in/out: fingerprint field updated
 {
-    const char* raw = jmpSession->hostkeyHash(LIBSSH2_HOSTKEY_HASH_MD5);
-    if (!raw) {
-        ShowStatusId(IDS_LOG_JUMP_NO_FP, nullptr, true);
-        return false;
-    }
-
-    std::string fp;
-    fp.reserve(16 * 3);
-    for (int i = 0; i < 16; i++) {
-        if (i > 0) fp += ' ';
-        fp += std::format("{:02X}", static_cast<unsigned char>(raw[i]));
+    const std::string endpoint = jump.host + ":" + std::to_string(jump.port);
+    std::array<char, 1024> savedEndpoint{};
+    GetPrivateProfileString(cs->DisplayName.c_str(), "jumpfingerprinthost", "", savedEndpoint.data(),
+                            static_cast<DWORD>(savedEndpoint.size()), cs->IniFileName.c_str());
+    if (savedEndpoint[0] && endpoint != savedEndpoint.data()) return false;
+    const std::string fp = Sha256HostFingerprint(jmpSession);
+    if (fp.empty()) return false;
+    if (MatchesLegacyFingerprint(jmpSession, jump.fingerprint)) {
+        WritePrivateProfileString(cs->DisplayName.c_str(), "jumpfingerprint", fp.c_str(), cs->IniFileName.c_str());
+        WritePrivateProfileString(cs->DisplayName.c_str(), "jumpfingerprinthost", endpoint.c_str(), cs->IniFileName.c_str());
+        jump.fingerprint = fp;
     }
     ShowStatus(("Jump host fingerprint: " + fp).c_str());
 
     if (jump.fingerprint == fp)
         return true;   // known host, matches
 
-    // First time or changed — ask user.
+    if (!jump.fingerprint.empty()) {
+        if (cs->feedback) cs->feedback->ShowError("Jump host key changed. Verify the server before updating the saved fingerprint.");
+        return false;
+    }
+    // First connection requires explicit acceptance.
     const bool firstTime = jump.fingerprint.empty();
     std::string msg = firstTime
         ? "First connection to jump host — fingerprint unknown.\nFingerprint: "
@@ -241,6 +246,7 @@ static bool VerifyJumpFingerprint(
     WritePrivateProfileString(
         cs->DisplayName.c_str(), "jumpfingerprint",
         fp.c_str(), cs->IniFileName.c_str());
+    WritePrivateProfileString(cs->DisplayName.c_str(), "jumpfingerprinthost", endpoint.c_str(), cs->IniFileName.c_str());
     jump.fingerprint = fp;
     return true;
 }

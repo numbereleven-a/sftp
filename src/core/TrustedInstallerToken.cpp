@@ -23,7 +23,9 @@
 #define TI_DEBUG_OUT(msg) ((void)0)
 
 static HANDLE g_hTrustedInstallerToken = NULL;
-static BOOL g_fTrustedInstallerImpersonationActive = FALSE;
+static thread_local unsigned g_tiDepth = 0;
+static thread_local HANDLE g_previousThreadToken = nullptr;
+static thread_local BOOL g_fTrustedInstallerImpersonationActive = FALSE;
 static WCHAR g_szOriginalUserSid[SECURITY_MAX_SID_STRING_CHARACTERS] = { 0 };
 
 // ============================================================================
@@ -247,39 +249,67 @@ extern "C" BOOL AcquireTrustedInstallerToken(void)
 {
     static SRWLOCK s_tiLock = SRWLOCK_INIT;
     AcquireSRWLockExclusive(&s_tiLock);
+    struct Unlock { SRWLOCK* lock; ~Unlock() { ReleaseSRWLockExclusive(lock); } } unlock{&s_tiLock};
+    if (g_tiDepth) { ++g_tiDepth; return TRUE; }
+    HANDLE previous = nullptr;
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_IMPERSONATE | TOKEN_QUERY, TRUE, &previous) &&
+        GetLastError() != ERROR_NO_TOKEN) return FALSE;
+    struct Restore {
+        HANDLE previous; bool success = false;
+        ~Restore() {
+            if (!success) {
+                if (previous) SetThreadToken(nullptr, previous); else RevertToSelf();
+                if (previous) CloseHandle(previous);
+            }
+        }
+    } restore{previous};
 
     CaptureOriginalUserSid();
 
     if (g_hTrustedInstallerToken != NULL) {
         if (!ImpersonateLoggedOnUser(g_hTrustedInstallerToken)) {
             TI_DEBUG_OUT(L"[TI] Failed to impersonate cached TI token\n");
-            ReleaseSRWLockExclusive(&s_tiLock);
             return FALSE;
         }
         g_fTrustedInstallerImpersonationActive = TRUE;
+        g_tiDepth = 1; g_previousThreadToken = previous; restore.success = true;
         EnablePrivilegeOnCurrentSecurityContext(L"SeBackupPrivilege");
         EnablePrivilegeOnCurrentSecurityContext(L"SeRestorePrivilege");
         TI_DEBUG_OUT(L"[TI] Successfully impersonating cached TrustedInstaller\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return TRUE;
     }
 
+    struct PrivilegeScope {
+        HANDLE token = nullptr;
+        TOKEN_PRIVILEGES original{};
+        bool changed = false;
+        explicit PrivilegeScope(LPCWSTR name) {
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) return;
+            TOKEN_PRIVILEGES requested{}; requested.PrivilegeCount = 1;
+            if (!LookupPrivilegeValueW(nullptr, name, &requested.Privileges[0].Luid)) return;
+            requested.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            DWORD bytes = sizeof(original);
+            changed = AdjustTokenPrivileges(token, FALSE, &requested, sizeof(original), &original, &bytes) &&
+                      GetLastError() == ERROR_SUCCESS;
+        }
+        ~PrivilegeScope() {
+            if (changed) AdjustTokenPrivileges(token, FALSE, &original, 0, nullptr, nullptr);
+            if (token) CloseHandle(token);
+        }
+    } debugPrivilege(L"SeDebugPrivilege"), impersonatePrivilege(L"SeImpersonatePrivilege");
     // Step 1: Enable SeDebugPrivilege + SeImpersonatePrivilege on our process token
-    if (!EnablePrivilege(L"SeDebugPrivilege")) {
+    if (!debugPrivilege.changed) {
         TI_DEBUG_OUT(L"[TI] Failed to enable SeDebugPrivilege\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return FALSE;
     }
-    if (!EnablePrivilege(L"SeImpersonatePrivilege")) {
+    if (!impersonatePrivilege.changed) {
         TI_DEBUG_OUT(L"[TI] Failed to enable SeImpersonatePrivilege\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return FALSE;
     }
 
     // Step 2: Impersonate SYSTEM (via winlogon.exe) so we can start/open TI service
     if (!ImpersonateSystem()) {
         TI_DEBUG_OUT(L"[TI] Failed to impersonate SYSTEM\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return FALSE;
     }
 
@@ -288,7 +318,6 @@ extern "C" BOOL AcquireTrustedInstallerToken(void)
     if (!tiPid) {
         RevertToSelf();
         TI_DEBUG_OUT(L"[TI] Failed to start TrustedInstaller service\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return FALSE;
     }
 
@@ -297,7 +326,6 @@ extern "C" BOOL AcquireTrustedInstallerToken(void)
     if (!hTIProcess) {
         RevertToSelf();
         TI_DEBUG_OUT(L"[TI] Failed to open TI process\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return FALSE;
     }
 
@@ -306,7 +334,6 @@ extern "C" BOOL AcquireTrustedInstallerToken(void)
         CloseHandle(hTIProcess);
         RevertToSelf();
         TI_DEBUG_OUT(L"[TI] Failed to open TI token\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return FALSE;
     }
     CloseHandle(hTIProcess);
@@ -319,7 +346,6 @@ extern "C" BOOL AcquireTrustedInstallerToken(void)
         CloseHandle(hTIToken);
         RevertToSelf();
         TI_DEBUG_OUT(L"[TI] Failed to duplicate TI token\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return FALSE;
     }
     CloseHandle(hTIToken);
@@ -338,7 +364,6 @@ extern "C" BOOL AcquireTrustedInstallerToken(void)
     if (!ImpersonateLoggedOnUser(hDupToken)) {
         CloseHandle(hDupToken);
         TI_DEBUG_OUT(L"[TI] Failed to impersonate TI token\n");
-        ReleaseSRWLockExclusive(&s_tiLock);
         return FALSE;
     }
 
@@ -349,6 +374,7 @@ extern "C" BOOL AcquireTrustedInstallerToken(void)
 
     g_hTrustedInstallerToken = hDupToken;
     g_fTrustedInstallerImpersonationActive = TRUE;
+    g_tiDepth = 1; g_previousThreadToken = previous; restore.success = true;
 
     if (!EnablePrivilegeOnCurrentSecurityContext(L"SeBackupPrivilege")) {
         TI_DEBUG_OUT(L"[TI] Failed to enable SeBackupPrivilege on TI token\n");
@@ -359,7 +385,6 @@ extern "C" BOOL AcquireTrustedInstallerToken(void)
 
     // The thread now runs as NT SERVICE\TrustedInstaller.
     TI_DEBUG_OUT(L"[TI] Successfully impersonating TrustedInstaller\n");
-    ReleaseSRWLockExclusive(&s_tiLock);
     return TRUE;
 }
 
@@ -367,7 +392,12 @@ extern "C" BOOL ReleaseTrustedInstallerToken(void)
 {
     if (!g_fTrustedInstallerImpersonationActive)
         return TRUE;
-    BOOL ok = RevertToSelf();
+    if (g_tiDepth > 1) { --g_tiDepth; return TRUE; }
+    BOOL ok = g_previousThreadToken ? SetThreadToken(nullptr, g_previousThreadToken) : RevertToSelf();
+    if (!ok) return FALSE;
+    if (g_previousThreadToken) CloseHandle(g_previousThreadToken);
+    g_previousThreadToken = nullptr;
+    g_tiDepth = 0;
     g_fTrustedInstallerImpersonationActive = FALSE;
     return ok;
 }

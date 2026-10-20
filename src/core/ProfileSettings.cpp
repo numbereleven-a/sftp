@@ -21,9 +21,9 @@ bool LoadProxySettingsFromNr(int proxynr, pConnectSettings ConnectResults, LPCST
         GetPrivateProfileString(proxyentry.data(), "proxyuser", "", proxyUser.data(), proxyUser.size() - 1, iniFileName);
         ConnectResults->proxyserver = proxyServer.data();
         ConnectResults->proxyuser = proxyUser.data();
-        std::array<char, 1024> szPassword{};
+        std::array<char, 8192> szPassword{};
         if (GetPrivateProfileString(proxyentry.data(), "proxypassword", "", szPassword.data(), szPassword.size(), iniFileName)) {
-            std::array<char, MAX_PATH> decPassword{};
+            std::array<char, 4096> decPassword{};
             DecryptString(szPassword.data(), decPassword.data(), static_cast<UINT>(decPassword.size()));
             ConnectResults->proxypassword = decPassword.data();
         } else
@@ -40,7 +40,7 @@ bool LoadProxySettingsFromNr(int proxynr, pConnectSettings ConnectResults, LPCST
 
 bool LoadServerSettings(LPCSTR DisplayName, pConnectSettings ConnectResults, LPCSTR iniFileName)
 {
-    std::array<char, 1024> szPassword{};
+    std::array<char, 8192> szPassword{};
     std::array<char, 6> modbuf{};
     ConnectResults->DisplayName = DisplayName ? DisplayName : "";
     ConnectResults->IniFileName = iniFileName ? iniFileName : "";
@@ -105,6 +105,11 @@ bool LoadServerSettings(LPCSTR DisplayName, pConnectSettings ConnectResults, LPC
     ConnectResults->php_recommended_chunk_mib = 0;
     ConnectResults->php_agent_hmac = false;
     ConnectResults->php_tar = GetPrivateProfileInt(DisplayName, "phptar", 0, iniFileName) != 0;
+    {
+        std::array<char, wdirtypemax> root{};
+        GetPrivateProfileString(DisplayName, "lanpairroot", "", root.data(), static_cast<DWORD>(root.size()), iniFileName);
+        ConnectResults->lan_pair_root = root.data();
+    }
     ConnectResults->lan_pair_role = GetPrivateProfileInt(DisplayName, "lanpairrole", 0, iniFileName);
     if (ConnectResults->lan_pair_role < 0 || ConnectResults->lan_pair_role > 2)
         ConnectResults->lan_pair_role = 0;
@@ -125,9 +130,10 @@ bool LoadServerSettings(LPCSTR DisplayName, pConnectSettings ConnectResults, LPC
     ConnectResults->password.clear();
     if (GetPrivateProfileString(DisplayName, "password", "",  szPassword.data(),  szPassword.size(),  iniFileName)) {
         if (!ConnectResults->useagent) {
-            std::array<char, MAX_PATH> decPassword{};
+            std::array<char, 4096> decPassword{};
             DecryptString(szPassword.data(), decPassword.data(), static_cast<UINT>(decPassword.size()));
             ConnectResults->password = decPassword.data();
+            SecureZeroMemory(decPassword.data(), decPassword.size());
         }
         else if (strcmp(szPassword.data(), "!") == 0)
             ConnectResults->password = "\001";
@@ -162,7 +168,7 @@ bool LoadServerSettings(LPCSTR DisplayName, pConnectSettings ConnectResults, LPC
 
         std::array<char, 1024> jumpPass{};
         if (GetPrivateProfileString(DisplayName, "jumppassword", "", jumpPass.data(), jumpPass.size(), iniFileName)) {
-            std::array<char, MAX_PATH> decJumpPass{};
+            std::array<char, 4096> decJumpPass{};
             DecryptString(jumpPass.data(), decJumpPass.data(), static_cast<UINT>(decJumpPass.size()));
             ConnectResults->jump_password = decJumpPass.data();
         } else {

@@ -346,7 +346,7 @@ BEGIN
             VALUE "FileDescription", "SFTP Plugin for Total Commander"
             VALUE "FileVersion", VER_FILEVERSION_STR
             VALUE "InternalName", "sftpplug"
-            VALUE "LegalCopyright", "Copyright (C) 2026 kvc.pl"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Marek Wesolowski - WESMAR"
             VALUE "OriginalFilename", "sftpplug.wfx"
             VALUE "ProductName", "SFTPplug"
             VALUE "ProductVersion", VER_PRODUCTVERSION_STR

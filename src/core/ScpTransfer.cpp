@@ -173,77 +173,7 @@ bool ParseScpCLine(const std::string& line, int64_t& outSize, std::string& outNa
 
 } // anonymous namespace
 
-int ConvertCrLfToLf(LPSTR data, size_t len)
-{
-    if (!data || len == 0)
-        return 0;
 
-    size_t out = 0;
-    for (size_t i = 0; i < len; ++i) {
-        const char ch = data[i];
-        if (ch == '\r' && i + 1 < len && data[i + 1] == '\n') {
-            continue;
-        }
-        data[out++] = ch;
-    }
-    return static_cast<int>(out);
-}
-
-// Counts the CRLF->LF output size of a chunk, carrying a pending lone CR
-// from the previous chunk (see CrLfToLfStateful). total accumulates the kept
-// byte count; a still-pending CR at the end is NOT included here, so callers
-// must add 1 if pendingCr is true after the final chunk.
-void CountCrLfToLf(const char* data, size_t len, bool& pendingCr, int64_t& total)
-{
-    size_t kept = 0;
-    size_t i = 0;
-    if (pendingCr) {
-        pendingCr = false;
-        ++kept;                       // lone CR from previous chunk…
-        if (len > 0 && data[0] == '\n') { i = 1; }  // …unless it pairs here
-    }
-    for (; i < len; ++i) {
-        if (data[i] == '\r' && i + 1 < len && data[i + 1] == '\n')
-            continue;                 // drop CR of an in-buffer CRLF
-        if (data[i] == '\r' && i + 1 == len) {
-            pendingCr = true;         // may pair with the next chunk
-            continue;
-        }
-        ++kept;
-    }
-    total += static_cast<int64_t>(kept);
-}
-
-// Converts one chunk with cross-chunk CRLF state. Separate in/out buffers,
-// so no in-place aliasing hazards; outCap must be >= len + 1 (worst case:
-// carried lone CR followed by a chunk with nothing dropped).
-size_t CrLfToLfStateful(const char* in, size_t len, char* out, bool& pendingCr)
-{
-    size_t o = 0;
-    size_t i = 0;
-    if (pendingCr) {
-        pendingCr = false;
-        if (len > 0 && in[0] == '\n') {
-            out[o++] = '\n';           // complete the split CRLF: keep the LF
-            i = 1;
-        } else {
-            out[o++] = '\r';           // previous chunk ended with a lone CR
-        }
-    }
-    for (; i < len; ++i) {
-        const char ch = in[i];
-        if (ch == '\r') {
-            if (i + 1 < len) {
-                if (in[i + 1] == '\n') continue;   // drop CR of an in-buffer CRLF
-            } else {
-                pendingCr = true;                  // may pair with the next chunk
-                continue;
-            }
-        }
-        out[o++] = ch;
-    }
-    return o;
-}
 
 void ShowTransferSpeedIfLarge(LPCSTR prefix, int64_t bytesTransferred, SYSTICKS starttime)
 {
@@ -519,13 +449,16 @@ int ShellScpDownloadFile(pConnectSettings cs,
 
         int64_t remaining = remoteSize;
         while (remaining > 0) {
-            const size_t want = std::min<size_t>(static_cast<size_t>(remaining), dataBuf.size());
+            const size_t want = std::min<size_t>(static_cast<size_t>(remaining),
+                                                textMode ? dataBuf.size() / 2 : dataBuf.size());
             int rc = static_cast<int>(scp.get()->read(dataBuf.data(), want));
             if (rc > 0) {
                 remaining -= rc;
                 int wlen = rc;
                 if (textMode)
-                    wlen = ConvertCrToCrLf(dataBuf.data(), static_cast<size_t>(rc), &lastWasCr);
+                    wlen = ConvertCrToCrLf(dataBuf.data(), static_cast<size_t>(rc), dataBuf.size(), &lastWasCr);
+                if (wlen < 0)
+                    return SFTP_READFAILED;
                 DWORD written = 0;
                 if (!WriteFile(localfile, dataBuf.data(), static_cast<DWORD>(wlen), &written, nullptr) ||
                     written != static_cast<DWORD>(wlen)) {

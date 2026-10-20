@@ -10,6 +10,7 @@
 
 #pragma comment(lib, "bcrypt.lib")
 
+#include <sddl.h>
 #include "global.h"
 #include "PpkConverter.h"
 #include "CoreUtils.h"
@@ -485,6 +486,12 @@ static bool DerivePpkV3Material(const PpkData& ppk, const char* passphrase,
         return false;
     }
 
+    if (ppk.argon2Memory > 256u * 1024u || !ppk.argon2Memory ||
+        ppk.argon2Passes > 16u || !ppk.argon2Passes ||
+        ppk.argon2Parallelism > 8u || !ppk.argon2Parallelism) {
+        err = PpkConvertError::unsupported_kdf;
+        return false;
+    }
     const char* pass = passphrase ? passphrase : "";
     const size_t passLen = strlen(pass);
 
@@ -534,25 +541,11 @@ static bool VerifyPpkV3Mac(const PpkData& ppk, const uint8_t* macKey, size_t mac
             ppk.algorithm.c_str(), ppk.encryption.c_str(), ppk.comment.c_str());
     PPK_LOG("VerifyPpkV3Mac: stored MAC=%s", ppk.macHex.c_str());
 
-    // Log the MAC data bytes for debugging
-    std::array<char, 1024> macDataHex{};
-    for (size_t i = 0; i < macData.size() && i < 500; i++) {
-        sprintf_s(macDataHex.data() + i * 2, 3, "%02x", macData[i]);
-    }
-    PPK_LOG("VerifyPpkV3Mac: macData (first 500 bytes)=%s", macDataHex.data());
-
     uint8_t hmac[32] = {};
     if (!HmacDigest(BCRYPT_SHA256_ALGORITHM, macKey, macKeyLen, macData.data(), macData.size(), hmac, sizeof(hmac))) {
         PPK_LOG_ERROR("HmacDigest failed");
         return false;
     }
-
-    // Log computed MAC for debugging
-    std::array<char, 65> computedMac{};
-    for (int i = 0; i < 32; i++) {
-        sprintf_s(computedMac.data() + i * 2, 3, "%02x", hmac[i]);
-    }
-    PPK_LOG("VerifyPpkV3Mac: computed MAC=%s", computedMac.data());
 
     uint8_t stored[32] = {};
     if (!HexDecode(ppk.macHex, stored, sizeof(stored))) {
@@ -937,22 +930,13 @@ static bool ConvertPpkToOpenSshImpl(const char* ppkPath, const char* passphrase,
             return false;
         }
 
-        if (encrypted) {
-            // v2 MAC is over encrypted blob
-            PPK_LOG("Verifying PPK v2 MAC (encrypted key)");
-            if (!VerifyPpkV2Mac(ppk, macKey, ppk.privateBlob)) {
-                PPK_LOG_ERROR("MAC verification failed for encrypted key");
-                err = PpkConvertError::bad_passphrase_or_mac;
-                return false;
-            }
-
-            if (!DecryptAes256Cbc(privatePlain, cipherKey, cipherIv)) {
-                err = PpkConvertError::bad_passphrase_or_mac;
-                return false;
-            }
-        } else {
-            // Unencrypted v2 key - no MAC verification needed
-            PPK_LOG("Unencrypted PPK v2 key - skipping MAC verification");
+        if (encrypted && !DecryptAes256Cbc(privatePlain, cipherKey, cipherIv)) {
+            err = PpkConvertError::bad_passphrase_or_mac;
+            return false;
+        }
+        if (!VerifyPpkV2Mac(ppk, macKey, privatePlain)) {
+            err = PpkConvertError::bad_passphrase_or_mac;
+            return false;
         }
 
         SecureZeroMemory(cipherKey, sizeof(cipherKey));
@@ -1039,6 +1023,18 @@ static bool ConvertPpkToOpenSshImpl(const char* ppkPath, const char* passphrase,
 
     strlcpy(outPemPath, tempBase.data(), outPemPathLen - 1);
     strlcat(outPemPath, ".pem", outPemPathLen - 1);
+
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        L"D:P(A;;FA;;;OW)", SDDL_REVISION_1, &descriptor, nullptr)) {
+        err = PpkConvertError::io_error; return false;
+    }
+    SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
+    HANDLE protectedFile = CreateFileA(outPemPath, GENERIC_WRITE, 0, &security,
+                                       CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    LocalFree(descriptor);
+    if (protectedFile == INVALID_HANDLE_VALUE) { err = PpkConvertError::io_error; return false; }
+    CloseHandle(protectedFile);
 
     PPK_LOG("Writing PEM file: %s label=%s derSize=%zu", outPemPath, pemLabel, pemDer.size());
     if (!WritePem(outPemPath, pemLabel, pemDer)) {

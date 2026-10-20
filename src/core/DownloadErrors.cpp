@@ -94,14 +94,14 @@ bool RemoveSkippedLocalFile(LPCWSTR localName) noexcept
 
 } // namespace
 
-int HandleBatchDownloadReadError(LPCWSTR remoteName, LPCWSTR localName,
-                                 bool move, bool requestedResume)
+int HandleBatchDownloadError(LPCWSTR remoteName, LPCWSTR localName,
+                            bool move, bool requestedResume, int error, bool removePartial)
 {
-    // WFX has no "skip" result. Returning success is safe for a copy after the
-    // incomplete local file is removed, but unsafe for a move because TC may
-    // then remove the source. Keep TC's normal error handling for moves.
+    // WFX has no "skip" result. A copy can continue with a logged omission,
+    // but reporting success for a move could make TC remove the source.
+    // Keep normal error handling for moves and existing resumed data.
     if (move || requestedResume || g_downloadErrorBatchDepth == 0)
-        return FS_FILE_READERROR;
+        return error;
 
     DownloadErrorChoice choice = DownloadErrorChoice::Skip;
     if (!g_skipAllDownloadErrors) {
@@ -112,14 +112,17 @@ int HandleBatchDownloadReadError(LPCWSTR remoteName, LPCWSTR localName,
             g_skipAllDownloadErrors = true;
     }
 
-    if (!RemoveSkippedLocalFile(localName))
-        return FS_FILE_WRITEERROR;
+    // A locked or read-only partial file must not break Skip all. Leave it in
+    // place and report that cleanup failed rather than claiming it was removed.
+    const bool cleanupFailed = removePartial && !RemoveSkippedLocalFile(localName);
 
     std::wstring message = LoadDownloadDialogText(IDS_LOG_DOWNLOAD_SKIPPED,
                                                    L"Skipped after a download error:");
     message += L" ";
     if (remoteName)
         message += remoteName;
+    if (cleanupFailed)
+        message += L" (could not remove the incomplete local file)";
     if (LogProcW)
         LogProcW(PluginNumber, MSGTYPE_IMPORTANTERROR, message.c_str());
     else if (LogProc) {
