@@ -1,5 +1,16 @@
 # Release Notes
 
+## SFTPplug 10.2.5.2
+
+- Fixed file copies within a session and between SSH/PHP sessions, overwrite checks, and F6 source removal after successful transfers. Resumed moves retain their sources.
+- Fixed shell paths, empty-directory removal, command exit-status handling, quoted SCP names, SCP acknowledgements, and incomplete-transfer detection.
+- Fixed upload I/O waits, local read failures, unsafe resume restarts, and SFTP initialization timeouts.
+- Fixed Alt+A permissions through SFTP and prevented verification codes from being saved as passwords.
+- Refused imported proxy/tunnel sessions whose routes cannot be reproduced.
+- Fixed LAN upload and rename overwrite authorization. Both peers must be updated; upload resume is explicitly unsupported.
+- Applied libssh2 1.11.1 packet, SFTP, authentication, and public-key-management security fixes and rebuilt both static libraries with mbedTLS.
+- Added loopback SSH/SFTP/SCP/PHP regression checks and guarded libssh2 parser checks for x64 and x86.
+
 ## SFTPplug 10.2.5.1
 
 - Extended Skip all to local write errors and general download failures during batch copying.

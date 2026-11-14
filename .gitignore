@@ -92,5 +92,7 @@ build/*.obj
 build/*.exe
 build/*.log
 tests/build/
+tests/__pycache__/
+artifacts/
 
 /bin/*.zip

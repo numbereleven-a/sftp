@@ -81,7 +81,8 @@ public:
     bool mkdir (const std::string& path)                          noexcept;
     bool remove(const std::string& path)                          noexcept;
     bool rename(const std::string& oldPath,
-                const std::string& newPath)                       noexcept;
+                const std::string& newPath, bool overwrite = false,
+                int* fsResult = nullptr)                         noexcept;
 
 private:
     struct Impl;

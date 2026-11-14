@@ -64,6 +64,10 @@ int main() {
     check(session->getFile(share + "/hello.txt", download.c_str(), 6, nullptr, true, true, &status) &&
           std::filesystem::file_size(download) == 6, "authenticated resume succeeded");
     check(session->putFile(download.c_str(), share + "/upload.txt", true, false, &status), "authenticated upload succeeded");
+    check(!session->putFile(download.c_str(), share + "/hello.txt", false, false, &status) && status == FS_FILE_EXISTS,
+          "upload asks before replacing an existing file");
+    check(!session->rename(share + "/upload.txt", share + "/hello.txt", false, &status) && status == FS_FILE_EXISTS,
+          "rename asks before replacing an existing file");
     check(session->rename(share + "/upload.txt", share + "/renamed.txt"), "authenticated rename succeeded");
     check(session->remove(share + "/renamed.txt"), "authenticated removal succeeded");
     session->disconnect();

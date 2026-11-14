@@ -26,7 +26,6 @@ constexpr DWORD kShellFreeTimeoutMs       = 5000;
 constexpr DWORD kScpPtyOpenTimeoutMs      = 10000;
 constexpr DWORD kScpShellOpenTimeoutMs    = 15000;
 constexpr DWORD kChannelReplyTimeoutMs    = 15000;
-constexpr DWORD kChannelExitStatusWaitMs  = 2000;
 constexpr DWORD kShellEagainGraceIdleMs   = 1000;
 constexpr DWORD kShellEagainGraceTotalMs  = 5000;
 constexpr DWORD kQuoteProgressStartMs     = 2000;
@@ -247,17 +246,12 @@ bool GetChannelCommandReply(ISshSession* session, ISshChannel* channel, const ch
         }
     }
 
-    // Wait for exit status
-    const auto exitStart = std::chrono::steady_clock::now();
-    while (channel->getExitStatus() == -1) {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - exitStart).count();
-        if (elapsed > kChannelExitStatusWaitMs)
-            break;
-        Sleep(50);
-    }
-
-    return (channel->getExitStatus() == 0 && !hasStderr);
+    if (!channel->eof()) return false;
+    tConnectSettings waitContext{};
+    waitContext.sock = sock;
+    if (WaitForOperation([&] { return channel->channelClose(); }, kShellCloseTimeoutMs, &waitContext) != 0)
+        return false;
+    return channel->getExitStatus() == 0 && !hasStderr;
 }
 
 bool EnsureScpShell(pConnectSettings cs)
@@ -281,9 +275,10 @@ bool EnsureScpShell(pConnectSettings cs)
     if (!channel)
         return false;
 
-    // Request PTY
+    // RFC 4254: disable terminal echo before sending long base64 commands.
+    const char modes[] = {53, 0, 0, 0, 0, 0}; // ECHO=0, TTY_OP_END
     int ptyRc = WaitForOperation([&] {
-        return channel->requestPty("vt102", 5, "", 0, 80, 40, 640, 480);
+        return channel->requestPty("vt102", 5, modes, sizeof(modes), 32768, 40, 0, 0);
     }, kScpPtyOpenTimeoutMs, cs);
 
     if (ptyRc < 0 && ptyRc != LIBSSH2_ERROR_EAGAIN) {
@@ -329,7 +324,7 @@ void CloseScpShell(pConnectSettings cs)
 
 bool ScpReadCommandOutput(pConnectSettings cs, const char* endMarker,
                            std::vector<std::string>& outLines,
-                           DWORD timeoutMs, const char* beginMarker)
+                           DWORD timeoutMs, const char* beginMarker, std::string* endLine)
 {
     if (!cs || !cs->scpShellChannel || !endMarker)
         return false;
@@ -355,17 +350,14 @@ bool ScpReadCommandOutput(pConnectSettings cs, const char* endMarker,
             continue;
 
         if (!gotBegin) {
-            if (trimmed.find(beginMarkerStr) != std::string_view::npos) {
+            if (trimmed == beginMarkerStr) {
                 gotBegin = true;
             }
             continue;
         }
 
         if (!IsEchoOrPromptLine(trimmed) && trimmed.substr(0, endMarkerStr.size()) == endMarkerStr) {
-            gotEnd = true;
-            break;
-        }
-        if (trimmed.find(endMarkerStr) != std::string_view::npos) {
+            if (endLine) *endLine = trimmed;
             gotEnd = true;
             break;
         }
@@ -535,6 +527,9 @@ int SftpQuoteCommand2(pConnectSettings cs, const char* remotedir, const char* cm
         }
     }
 
+    if (!channel->eof()) return -1;
+    const int closeRc = WaitForOperation([&] { return channel->channelClose(); }, kShellCloseTimeoutMs, cs);
+    if (closeRc != 0) return -1;
     const int rc = channel->getExitStatus();
     if (rc != 0) {
         char tmp[128];
@@ -637,6 +632,9 @@ int SftpQuoteCommand2W(pConnectSettings cs, LPCWSTR remotedir, LPCWSTR cmd,
         }
     }
 
+    if (!channel->eof()) return -1;
+    const int closeRc = WaitForOperation([&] { return channel->channelClose(); }, kShellCloseTimeoutMs, cs);
+    if (closeRc != 0) return -1;
     const int rc = channel->getExitStatus();
     if (rc != 0) {
         char tmp[128];

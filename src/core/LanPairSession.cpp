@@ -554,12 +554,16 @@ bool LanPairSession::getFile(const std::string& remotePath,
 
 bool LanPairSession::putFile(LPCWSTR            localPath,
                              const std::string& remotePath,
-                             bool               /*overwrite*/,
-                             bool               /*resume*/,
+                             bool               overwrite,
+                             bool               resume,
                              int*               fsResult) noexcept
 {
     if (fsResult) *fsResult = FS_FILE_READERROR;
     if (!isConnected()) return false;
+    if (resume) {
+        if (fsResult) *fsResult = FS_FILE_NOTSUPPORTED;
+        return false;
+    }
 
     const bool tiAcquired = (impl_ && impl_->trustedInstaller_) && AcquireTrustedInstallerToken();
     struct TiScope { bool a; ~TiScope() { if (a) ReleaseTrustedInstallerToken(); } } tiScope{tiAcquired};
@@ -580,11 +584,11 @@ bool LanPairSession::putFile(LPCWSTR            localPath,
     const int64_t fileSize = sz.QuadPart;
 
     std::ostringstream req;
-    req << "PUT " << b64EncodeStr(remotePath) << " " << fileSize;
+    req << "PUT2 " << b64EncodeStr(remotePath) << " " << fileSize << " " << (overwrite ? 1 : 0);
     const auto resp = impl_->cmd(req.str());
     if (resp.empty() || resp[0] != "OK") {
         CloseHandle(hLocal);
-        if (fsResult) *fsResult = FS_FILE_WRITEERROR;
+        if (fsResult) *fsResult = !resp.empty() && resp[0] == "EXISTS" ? FS_FILE_EXISTS : FS_FILE_WRITEERROR;
         return false;
     }
 
@@ -639,11 +643,13 @@ bool LanPairSession::remove(const std::string& path) noexcept {
 }
 
 bool LanPairSession::rename(const std::string& oldPath,
-                            const std::string& newPath) noexcept {
+                            const std::string& newPath, bool overwrite, int* fsResult) noexcept {
+    if (fsResult) *fsResult = FS_FILE_WRITEERROR;
     if (!isConnected()) return false;
-    const std::string line = "REN " + b64EncodeStr(oldPath)
-                           + " "   + b64EncodeStr(newPath);
+    const std::string line = "REN2 " + b64EncodeStr(oldPath)
+                           + " "   + b64EncodeStr(newPath) + (overwrite ? " 1" : " 0");
     const auto resp = impl_->cmd(line);
+    if (fsResult && !resp.empty()) *fsResult = resp[0] == "OK" ? FS_FILE_OK : resp[0] == "EXISTS" ? FS_FILE_EXISTS : FS_FILE_WRITEERROR;
     return !resp.empty() && resp[0] == "OK";
 }
 
@@ -718,13 +724,17 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
             } else if (cmd == "PUT" && parts.size() >= 3) {
                 const int64_t size = static_cast<int64_t>(
                     std::strtoll(parts[2].c_str(), nullptr, 10));
-                cmdPut(s, b64DecodeStr(parts[1]), size);
+                cmdPut(s, b64DecodeStr(parts[1]), size, false);
+            } else if (cmd == "PUT2" && parts.size() == 4 && (parts[3] == "0" || parts[3] == "1")) {
+                cmdPut(s, b64DecodeStr(parts[1]), std::strtoll(parts[2].c_str(), nullptr, 10), parts[3] == "1");
             } else if (cmd == "MKDIR" && parts.size() >= 2) {
                 cmdMkdir(s, b64DecodeStr(parts[1]));
             } else if (cmd == "DEL" && parts.size() >= 2) {
                 cmdDel(s, b64DecodeStr(parts[1]));
             } else if (cmd == "REN" && parts.size() >= 3) {
-                cmdRen(s, b64DecodeStr(parts[1]), b64DecodeStr(parts[2]));
+                cmdRen(s, b64DecodeStr(parts[1]), b64DecodeStr(parts[2]), false);
+            } else if (cmd == "REN2" && parts.size() == 4 && (parts[3] == "0" || parts[3] == "1")) {
+                cmdRen(s, b64DecodeStr(parts[1]), b64DecodeStr(parts[2]), parts[3] == "1");
             } else {
                 sendLine(s, "ERR unknown-command");
             }
@@ -857,15 +867,15 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
         CloseHandle(h);
     }
 
-    void cmdPut(SOCKET s, const std::string& path, int64_t size) {
+    void cmdPut(SOCKET s, const std::string& path, int64_t size, bool overwrite) {
         if (size < 0) { sendLine(s, "ERR bad-size"); return; }
         const std::wstring wpath = allowedPath(path);
         if (wpath.empty()) { sendLine(s, "ERR path-not-allowed"); return; }
         HANDLE h = CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                               overwrite ? CREATE_ALWAYS : CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             // Client sends data only AFTER receiving "OK", so nothing to drain here.
-            sendLine(s, "ERR open-failed");
+            sendLine(s, GetLastError() == ERROR_FILE_EXISTS ? "EXISTS" : "ERR open-failed");
             return;
         }
 
@@ -916,11 +926,14 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
     }
 
     void cmdRen(SOCKET s, const std::string& oldPath,
-                          const std::string& newPath) noexcept {
+                          const std::string& newPath, bool overwrite) noexcept {
         const std::wstring wold = allowedPath(oldPath);
         const std::wstring wnew = allowedPath(newPath);
         if (wold.empty() || wnew.empty()) { sendLine(s, "ERR path-not-allowed"); return; }
-        sendLine(s, MoveFileExW(wold.c_str(), wnew.c_str(), MOVEFILE_REPLACE_EXISTING)
+        if (!overwrite && GetFileAttributesW(wnew.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            sendLine(s, "EXISTS"); return;
+        }
+        sendLine(s, MoveFileExW(wold.c_str(), wnew.c_str(), overwrite ? MOVEFILE_REPLACE_EXISTING : 0)
                         ? "OK" : "ERR rename-failed");
     }
 

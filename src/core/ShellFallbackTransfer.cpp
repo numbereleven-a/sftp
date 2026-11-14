@@ -54,11 +54,7 @@ static std::string ShellNormalizeScpPath(const std::string& path)
 {
     if (path.empty())
         return ".";
-    if (path[0] != '/')
-        return path;
-    if (path.size() == 1)
-        return ".";
-    return path.substr(1);
+    return path;
 }
 
 static std::unique_ptr<ISshChannel> OpenShellDdChannel(pConnectSettings cs, const char* where)
@@ -183,7 +179,7 @@ static bool ShellExecPersistentProcessLines(
             continue;
 
         if (!gotBeginMarker) {
-            if (strstr(p, beginMarker.data()) != nullptr) {
+            if (strcmp(p, beginMarker.data()) == 0) {
                 gotBeginMarker = true;
                 SFTP_LOG("SCP", "Detected BEGIN marker: %s", beginMarker.data());
             }
@@ -193,11 +189,7 @@ static bool ShellExecPersistentProcessLines(
         // Prefer exact line-start marker matching, but also accept marker anywhere
         // in the line for shells that inject prompt prefixes.
         if (!ShellIsEchoOrPromptLine(p) && strncmp(p, endMarker.data(), endMarkerLen) == 0) {
-            gotEndMarker = true;
-            break;
-        }
-        if (strstr(p, endMarker.data()) != nullptr) {
-            gotEndMarker = true;
+            gotEndMarker = strcmp(p + endMarkerLen, ":0") == 0;
             break;
         }
 
@@ -465,7 +457,7 @@ static int ShellDdDownloadBase64(
     SHELL_DD_LOG("b64 DL end: lines=%d decodedTotal=%lld out=%lld",
                  lineCount, (long long)decodedTotal, (long long)*outSizeLoaded);
 
-    if (lineCount == 0 && hintedSize > resumeFrom) {
+    if (*outSizeLoaded != hintedSize) {
         SHELL_DD_LOG("b64 DL failed: no lines returned for non-empty file");
         return SFTP_READFAILED;
     }
@@ -533,6 +525,10 @@ static int ShellDdUploadRaw(
     }
 
     // Signal EOF so the remote "cat" process exits and flushes its output.
+    if (*outSizeLoaded != fileSize) {
+        DisconnectShell(ch.get());
+        return SFTP_READFAILED;
+    }
     const SYSTICKS eofStart = get_sys_ticks();
     while (ch->sendEof() == LIBSSH2_ERROR_EAGAIN) {
         if (get_ticks_between(eofStart) > (int)SFTP_SCP_WRITE_IDLE_TIMEOUT_MS)
@@ -549,7 +545,10 @@ static int ShellDdUploadRaw(
         ScpWaitIo(cs, false);
     }
 
+    const int closeRc = WaitForOperation([&] { return ch->channelClose(); }, SFTP_SCP_WRITE_IDLE_TIMEOUT_MS, cs);
+    const bool complete = ch->eof() && closeRc == 0 && ch->getExitStatus() == 0;
     DisconnectShell(ch.get());
+    if (!complete) return SFTP_WRITEFAILED;
     ShowTransferSpeedIfLarge("Shell-raw UL", *outSizeLoaded - resumeFrom, starttime);
     return SFTP_OK;
 }
@@ -566,11 +565,8 @@ static int ShellDdUploadBase64(
     int64_t resumeFrom,
     int64_t* outSizeLoaded)
 {
-    // Align resume to 3-byte boundary (base64 encodes in groups of 3).
-    // If alignedResume < resumeFrom, remote file has 1-2 extra bytes —
-    // known limitation: truncate not reliable on restricted hosts.
-    // Worst case: TC detects size mismatch and retransfers the file.
-    int64_t alignedResume = (resumeFrom / 3) * 3;
+    // Each chunk is decoded independently, so resume at the exact byte offset.
+    int64_t alignedResume = resumeFrom;
     *outSizeLoaded = alignedResume;
 
     if (alignedResume > 0) {
@@ -621,6 +617,13 @@ static int ShellDdUploadBase64(
         }
     }
 
+    if (*outSizeLoaded != fileSize) return SFTP_READFAILED;
+    if (firstChunk && alignedResume == 0) {
+        std::vector<std::string> output;
+        if (!ShellExecPersistentCollectLines(cs, ": > '" + string_util::ShellQuoteSingle(remotePath) + "'", output))
+            return SFTP_WRITEFAILED;
+    }
+    if (ShellGetRemoteFileSize(cs, remotePath) != fileSize) return SFTP_WRITEFAILED;
     ShowTransferSpeedIfLarge("Shell-b64 UL", *outSizeLoaded - alignedResume, starttime);
     return SFTP_OK;
 }
@@ -721,7 +724,7 @@ int ShellDdUploadFile(
         if (remoteSize >= 0 && remoteSize <= fileSize)
             resumeFrom = remoteSize;
         else
-            resumeFrom = 0;
+            return SFTP_WRITEFAILED;
     }
 
     if (!cs->shell_dd_b64only) {
@@ -730,7 +733,7 @@ int ShellDdUploadFile(
         if (rc == SFTP_OK) {
             // Verify remote size.
             int64_t remoteSize = ShellGetRemoteFileSize(cs, remotePath);
-            if (fileSize > 0 && remoteSize != fileSize) {
+            if (remoteSize != fileSize) {
                 SHELL_DD_LOG("raw UL size mismatch: remote=%lld expected=%lld, switching to base64",
                              (long long)remoteSize, (long long)fileSize);
                 cs->shell_dd_b64only = true;
@@ -795,7 +798,7 @@ int ShellScpUploadFile(
     // interpreted (command injection).  Single-quote the whole argument;
     // ShellQuoteSingle escapes embedded single quotes as '\''.
     std::string cmd = "scp -t '";
-    cmd += string_util::ShellQuoteSingle(BuildScpPathArgument(remotePathArg));
+    cmd += string_util::ShellQuoteSingle(remotePathArg);
     cmd += "'";
     if (!SendChannelCommandNoEof(cs->session.get(), channel.get(), cmd.c_str(), cs->sock)) {
         DisconnectShell(channel.get());
@@ -874,6 +877,11 @@ int ShellScpUploadFile(
         }
     }
 
+    LARGE_INTEGER measured{};
+    if (!GetFileSizeEx(localfile, &measured) || *outSizeLoaded != measured.QuadPart) {
+        DisconnectShell(channel.get());
+        return SFTP_READFAILED;
+    }
     const char zero = 0;
     if (!ScpWriteAll(channel.get(), cs, &zero, 1, SFTP_SCP_WRITE_IDLE_TIMEOUT_MS) ||
         !ScpReadAck(channel.get(), cs, ackErr)) {

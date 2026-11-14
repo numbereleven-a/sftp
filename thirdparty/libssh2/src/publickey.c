@@ -972,6 +972,7 @@ libssh2_publickey_list_fetch(LIBSSH2_PUBLICKEY * pkey, unsigned long *num_keys,
                     goto err_exit;
                 }
                 list = newlist;
+                memset(&list[keys], 0, sizeof(list[keys]));
             }
             if(pkey->version == 1) {
                 unsigned long comment_len;
@@ -988,6 +989,13 @@ libssh2_publickey_list_fetch(LIBSSH2_PUBLICKEY * pkey, unsigned long *num_keys,
                 }
 
                 if(comment_len) {
+                    if(pkey->listFetch_s + comment_len >
+                       pkey->listFetch_data + pkey->listFetch_data_len) {
+                        _libssh2_error(session, LIBSSH2_ERROR_BUFFER_TOO_SMALL,
+                                 "ListFetch data too short");
+                        goto err_exit;
+                    }
+
                     list[keys].num_attrs = 1;
                     list[keys].attrs =
                         LIBSSH2_ALLOC(session,
@@ -1114,6 +1122,11 @@ libssh2_publickey_list_fetch(LIBSSH2_PUBLICKEY * pkey, unsigned long *num_keys,
                 }
 
                 if(list[keys].num_attrs) {
+                    if(list[keys].num_attrs > 1024) {
+                        _libssh2_error(session, LIBSSH2_ERROR_OUT_OF_BOUNDARY,
+                                 "Too many publickey attributes");
+                        goto err_exit;
+                    }
                     list[keys].attrs =
                         LIBSSH2_ALLOC(session,
                                       list[keys].num_attrs *

@@ -302,7 +302,7 @@ int DownloadLoop(pConnectSettings cs, Handle& remote, LocalFile& local,
 } // anonymous namespace
 
 int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName,
-                      bool alwaysOverwrite, int64_t filesize, LPFILETIME ft, bool Resume)
+                      bool alwaysOverwrite, int64_t filesize, LPFILETIME ft, bool Resume, bool binaryCopy)
 {
     if (!cs) return SFTP_FAILED;
     if (IsPhpAgentTransport(cs))
@@ -317,7 +317,7 @@ int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName
     ShowTransferStart(useScp, RemoteName, IDS_DOWNLOAD);
 
     std::string remotePath = ToRemotePathA(cs, RemoteName);
-    bool textMode = (cs->unixlinebreaks == 1) && SftpDetermineTransferModeW(RemoteName);
+    bool textMode = !binaryCopy && (cs->unixlinebreaks == 1) && SftpDetermineTransferModeW(RemoteName);
     if (textMode && Resume)
         return SFTP_FAILED;
 
@@ -379,12 +379,20 @@ int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName
         RemoteScpChannel remoteScp(std::move(scpHandle), cs);
         ret = DownloadLoop(cs, remoteScp, local, RemoteName, LocalName,
                            textMode, filesize, loaded, scpRemain, lastWasCr);
+        if (ret == SFTP_OK) {
+            std::string error;
+            if (scpRemain != 0 || !ScpReadAck(remoteScp.get(), cs, error))
+                ret = SFTP_READFAILED;
+            if (!error.empty()) ShowStatus(error.c_str());
+        }
     } else {
         RemoteSftpFile remoteSftp(std::move(sftpHandle));
         int64_t dummyRemain = 0; // not used for SFTP
         ret = DownloadLoop(cs, remoteSftp, local, RemoteName, LocalName,
                            textMode, filesize, loaded, dummyRemain, lastWasCr);
     }
+    if (ret == SFTP_OK && loaded != filesize)
+        ret = SFTP_READFAILED;
 
     // Close remote (RAII handles will close automatically)
     if (ret == SFTP_OK && ft)
@@ -397,7 +405,7 @@ int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName
 }
 
 int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
-                    bool Resume, bool setattr)
+                    bool Resume, bool setattr, bool binaryCopy)
 {
     if (!cs) return SFTP_FAILED;
     if (IsPhpAgentTransport(cs))
@@ -425,7 +433,9 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
     ShowTransferStart(useScp, RemoteName, IDS_UPLOAD);
 
     std::string remotePath = ToRemotePathA(cs, RemoteName);
-    bool textMode = (cs->unixlinebreaks == 1) && SftpDetermineTransferModeW(LocalName);
+    bool textMode = !binaryCopy && (cs->unixlinebreaks == 1) && SftpDetermineTransferModeW(LocalName);
+    // Converted byte offsets cannot safely resume an existing remote file.
+    if (Resume && textMode) return SFTP_WRITEFAILED;
 
     if (forceShellFallback) {
         int64_t shellUploaded = 0;
@@ -478,12 +488,11 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
     std::unique_ptr<RemoteSftpFile> remoteSftp;
     std::unique_ptr<RemoteScpChannel> remoteScp;
     int64_t resumeOffset = 0;
-    bool truncateRestart = false;
 
     if (useScp) {
         if (cs->scponly) {
             // Shell SCP upload
-            return ShellScpUploadFile(cs, BuildScpPathArgument(remotePath), RemoteName,
+            return ShellScpUploadFile(cs, remotePath, RemoteName,
                                       local.get(), LocalName, uploadSize, textMode, &filesize);
         } else {
             // Native SCP upload
@@ -491,11 +500,19 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
             long mtime = 0;
             if (setattr && GetFileTime(local.get(), nullptr, nullptr, &ft))
                 mtime = GetUnixTime(&ft);
-            scpHandle = cs->session->scpSend64(remotePath.c_str(), cs->filemod,
-                                               static_cast<uint64_t>(uploadSize), mtime, 0);
+            const auto openStart = get_sys_ticks();
+            do {
+                scpHandle = cs->session->scpSend64(remotePath.c_str(), cs->filemod,
+                    static_cast<uint64_t>(uploadSize), mtime, 0);
+                if (scpHandle || cs->session->lastErrno() != LIBSSH2_ERROR_EAGAIN)
+                    break;
+                if (EscapePressed() || get_ticks_between(openStart) > SFTP_SCP_CHANNEL_OPEN_TIMEOUT_MS)
+                    break;
+                WaitForSshIo(cs);
+            } while (true);
             if (!scpHandle) {
                 SftpLogLastError("SCP upload error: ", cs->session->lastErrno());
-                return SFTP_READFAILED;
+                return SFTP_WRITEFAILED;
             }
             remoteScp = std::make_unique<RemoteScpChannel>(std::move(scpHandle), cs);
         }
@@ -509,12 +526,7 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
             return SFTP_WRITEFAILED;
         remoteSftp = std::make_unique<RemoteSftpFile>(std::move(sftpHandle));
 
-        if (Resume && textMode) {
-            // In text mode local and remote byte offsets are not 1:1 (CRLF
-            // pairs collapse to LF), so resuming at a raw offset would shift
-            // the content. Restart cleanly with truncation instead.
-            truncateRestart = true;
-        } else if (Resume) {
+        if (Resume) {
             // Get remote size and seek
             LIBSSH2_SFTP_ATTRIBUTES attr{};
             // Request both permissions AND size from server
@@ -525,36 +537,19 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
                 if (rc == LIBSSH2_ERROR_EAGAIN)
                     WaitForSshIo(cs);
             } while (rc == LIBSSH2_ERROR_EAGAIN);
-            // Check if server actually returned size (some servers may not honor the flag)
-            if (rc == 0 && (attr.flags & LIBSSH2_SFTP_ATTR_SIZE) && attr.filesize > 0) {
+            if (rc != 0 || !(attr.flags & LIBSSH2_SFTP_ATTR_SIZE) || attr.filesize > static_cast<uint64_t>(filesize))
+                return SFTP_WRITEFAILED;
+            if (attr.filesize > 0) {
                  int64_t remoteSize = static_cast<int64_t>(attr.filesize);
                 if (remoteSize <= filesize) {
                     remoteSftp->get()->seek(static_cast<size_t>(remoteSize));
                     if (!local.Seek(remoteSize))
                         return SFTP_READFAILED;
                     resumeOffset = remoteSize;
-                } else {
-                    // Remote file is LONGER than local: resuming in place would
-                    // leave a stale tail beyond the rewritten prefix. Restart
-                    // cleanly with truncation.
-                    truncateRestart = true;
                 }
-            } else {
-                // Remote size unknown — cannot resume safely, restart truncated.
-                truncateRestart = true;
             }
         }
 
-        if (truncateRestart) {
-            remoteSftp.reset();
-            const unsigned long truncFlags =
-                LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC;
-            sftpHandle = OpenSftpFileWithRetry(cs, remotePath.c_str(), truncFlags, 0644);
-            if (!sftpHandle)
-                return SFTP_WRITEFAILED;
-            remoteSftp = std::make_unique<RemoteSftpFile>(std::move(sftpHandle));
-            resumeOffset = 0;
-        }
     }
 
     // Upload loop
@@ -586,7 +581,7 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
                         return false;
                     }
                 }
-                IsSocketWritable(cs->sock);
+                WaitForSshIo(cs);
             } else {
                 SftpLogLastError("Upload write error: ", w);
                 return false;
@@ -597,7 +592,11 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
 
     while (true) {
         DWORD read = 0;
-        if (!ReadFile(local.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) || read == 0)
+        if (!ReadFile(local.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr)) {
+            ret = SFTP_READFAILED;
+            break;
+        }
+        if (read == 0)
             break;
 
         size_t dataLen = read;
@@ -626,6 +625,15 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
         const char cr = '\r';
         if (!writeAll(&cr, 1))
             ret = SFTP_WRITEFAILED;
+    }
+
+    if (ret == SFTP_OK && sent != filesize)
+        ret = SFTP_READFAILED;
+    if (ret == SFTP_OK && remoteScp) {
+        std::string error;
+        if (!ScpSendAck(remoteScp->get(), cs) || !ScpReadAck(remoteScp->get(), cs, error))
+            ret = SFTP_WRITEFAILED;
+        if (!error.empty()) ShowStatus(error.c_str());
     }
 
     // Finalize the remote file before reporting upload completion. Destroying

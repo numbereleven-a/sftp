@@ -9,6 +9,7 @@
 // All functions return SFTP_OK / SFTP_* error codes used by the plugin.
 
 int PhpAgentProbe(pConnectSettings cs);
+int PhpAgentFileExistsW(pConnectSettings cs, LPCWSTR path);
 int PhpAgentValidateAuth(pConnectSettings cs, std::string& outErrorText);
 int PhpAgentListDirectoryW(pConnectSettings cs, LPCWSTR remoteDir, std::vector<WIN32_FIND_DATAW>& outEntries);
 int PhpAgentDownloadFileW(pConnectSettings cs,

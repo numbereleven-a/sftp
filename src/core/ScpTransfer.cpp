@@ -306,8 +306,6 @@ std::string BuildScpPathArgument(const std::string& path)
 {
     if (path.empty()) return {};
     std::string scpTarget = path;
-    if (path[0] == '/')
-        scpTarget = (path.size() == 1) ? "." : path.substr(1);
     if (SSH_ScpNeedQuote && scpTarget.find(' ') != std::string::npos)
         return "\"" + scpTarget + "\"";
     return scpTarget;
@@ -386,16 +384,14 @@ int ShellScpDownloadFile(pConnectSettings cs,
     if (!channel)
         return SFTP_FAILED;
 
-    std::string cmd = "scp -f ";
-    cmd += remotePathArg;
+    std::string cmd = "scp -f '" + string_util::ShellQuoteSingle(remotePathArg) + "'";
     if (!SendChannelCommandNoEof(cs->session.get(), channel.get(), cmd.c_str(), cs->sock)) {
         return SFTP_READFAILED;
     }
 
     ScpChannel scp(std::move(channel), cs);
     std::string err;
-    if (!scp.SendAck(SFTP_SCP_WRITE_IDLE_TIMEOUT_MS) ||
-        !scp.ReadAck(err, SFTP_SCP_READ_IDLE_TIMEOUT_MS)) {
+    if (!scp.SendAck(SFTP_SCP_WRITE_IDLE_TIMEOUT_MS)) {
         if (!err.empty()) ShowStatus(err.c_str());
         return SFTP_READFAILED;
     }

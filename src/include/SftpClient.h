@@ -184,8 +184,8 @@ int  SftpFindClose(pConnectSettings ConnectSettings, LPVOID davdataptr);
 
 int  SftpCreateDirectoryW(pConnectSettings ConnectSettings, LPCWSTR Path);
 int  SftpRenameMoveFileW(pConnectSettings ConnectSettings, LPCWSTR OldName, LPCWSTR NewName, bool Move, bool Overwrite, bool isdir);
-int  SftpDownloadFileW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, LPCWSTR LocalName, bool alwaysoverwrite, int64_t filesize, LPFILETIME ft, bool Resume);
-int  SftpUploadFileW(pConnectSettings ConnectSettings, LPCWSTR LocalName, LPCWSTR RemoteName, bool Resume, bool setattr);
+int  SftpDownloadFileW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, LPCWSTR LocalName, bool alwaysoverwrite, int64_t filesize, LPFILETIME ft, bool Resume, bool binaryCopy = false);
+int  SftpUploadFileW(pConnectSettings ConnectSettings, LPCWSTR LocalName, LPCWSTR RemoteName, bool Resume, bool setattr, bool binaryCopy = false);
 int  SftpDeleteFileW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, bool isdir);
 int  SftpSetAttr(pConnectSettings ConnectSettings, LPCSTR RemoteName, int NewAttr);
 int  SftpSetDateTimeW(pConnectSettings ConnectSettings, LPCWSTR RemoteName, LPFILETIME LastWriteTime, LPFILETIME LastAccessTime = nullptr);

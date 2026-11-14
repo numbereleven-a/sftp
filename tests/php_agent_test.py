@@ -135,15 +135,15 @@ def main():
             with tempfile.TemporaryDirectory(prefix=root.name + '-outside-') as outside:
                 outside_path = Path(outside)
                 (outside_path / 'secret.txt').write_text('outside-test-marker')
-                try:
-                    os.symlink(outside_path, root / 'escape', target_is_directory=True)
-                except OSError:
-                    print('SKIP symlink escape checks: symbolic-link creation unavailable')
+                if os.name == 'nt':
+                    import _winapi
+                    _winapi.CreateJunction(str(outside_path), str(root / 'escape'))
                 else:
-                    check(request('GET', extra={'path': 'escape/secret.txt'})[0] == 403,
-                          'read through outward symlink rejected')
-                    check(request('PUT', b'new', extra={'path': 'escape/new.txt'})[0] == 403,
-                          'write through outward symlink rejected')
+                    os.symlink(outside_path, root / 'escape', target_is_directory=True)
+                check(request('GET', extra={'path': 'escape/secret.txt'})[0] == 403,
+                      'read through outward directory link rejected')
+                check(request('PUT', b'new', extra={'path': 'escape/new.txt'})[0] == 403,
+                      'write through outward directory link rejected')
             print('All PHP agent checks passed.')
         finally:
             server.terminate()

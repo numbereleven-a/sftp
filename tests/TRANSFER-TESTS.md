@@ -17,3 +17,19 @@ With `-PhpPath` set to a local PHP executable, the runner starts an isolated loo
 checks the C++ production signer against it. Both plain-environment and hash-only deployed credentials
 are exercised. Python must be available as `python.exe` or passed with `-PythonPath`.
 No router configuration or real profiles are used.
+
+`run-ssh-tests.ps1` runs additional production-code checks after a Release build.
+Pass `-VcVarsPath`, `-Architecture`, and `-ShellPath` (a POSIX shell, including
+BusyBox for Windows); add `-PhpPath` for the production PHP client checks.
+Python needs Paramiko on its module search path. The runner
+links the Release objects and tests a disposable loopback SSH/SFTP peer, file
+copy/move, overwrite refusal, read failures, SCP acknowledgements, shell quoting,
+and shell upload/delete errors. All files and credentials are synthetic.
+Both peers must use the updated plugin for LAN uploads and renames; older peers
+refuse the new commands instead of silently replacing files. LAN upload resume
+is explicitly unsupported.
+
+The same runner executes `libssh2_boundary_test.c` against the production SFTP and
+transport parsers: valid and malformed NAME replies, STATUS request IDs, a short
+ETM packet, and malformed EXT_INFO. Guard pages turn out-of-bounds accesses into
+deterministic failures. Run both x64 and x86.

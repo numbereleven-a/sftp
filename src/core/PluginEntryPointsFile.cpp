@@ -231,20 +231,52 @@ int WINAPI FsRenMovFileW(LPCWSTR OldName, LPCWSTR NewName, BOOL Move, BOOL OverW
         olddir.resize(wcslen(olddir.data()));
         newdir.resize(wcslen(newdir.data()));
 
-        // Source and destination must be on the same server.
-        if (serverid1 != serverid2 || serverid1 == nullptr)
+        if (!serverid1 || !serverid2)
             return FS_FILE_NOTFOUND;
 
         ResetLastPercent(serverid1);
 
         bool isdir = (ri->Attr & FILE_ATTRIBUTE_DIRECTORY) ? true : false;
 
+        // SFTP has rename but no portable copy operation. Relay file copies
+        // through a temporary local file, including copies between sessions.
+        if (serverid1 != serverid2 || (!Move && !serverid1->scponly)) {
+            if (isdir || IsLanPairTransport(serverid1) || IsLanPairTransport(serverid2))
+                return FS_FILE_NOTSUPPORTED;
+            std::wstring oldPath(olddir), newPath(newdir);
+            std::replace(oldPath.begin(), oldPath.end(), L'\\', L'/');
+            std::replace(newPath.begin(), newPath.end(), L'\\', L'/');
+            if (oldPath == newPath && (serverid1 == serverid2 ||
+                (serverid1->server == serverid2->server && serverid1->customport == serverid2->customport &&
+                 serverid1->user == serverid2->user && serverid1->transfermode == serverid2->transfermode)))
+                return FS_FILE_WRITEERROR;
+            if (!OverWrite) {
+                const int exists = SftpFileExistsW(serverid2, newdir.c_str());
+                if (exists != 0) return exists > 0 ? FS_FILE_EXISTS : FS_FILE_WRITEERROR;
+            }
+            std::array<wchar_t, MAX_PATH> tempDir{}, tempFile{};
+            const DWORD tempLen = GetTempPathW(static_cast<DWORD>(tempDir.size()), tempDir.data());
+            if (!tempLen || tempLen >= tempDir.size() || !GetTempFileNameW(tempDir.data(), L"sft", 0, tempFile.data()))
+                return FS_FILE_WRITEERROR;
+            struct TempFile { LPCWSTR path; ~TempFile() { DeleteFileW(path); } } cleanup{tempFile.data()};
+            const int getRc = SftpDownloadFileW(serverid1, olddir.c_str(), tempFile.data(), true, ri->Size64, &ri->LastWriteTime, false, true);
+            if (getRc != SFTP_OK) return getRc == SFTP_ABORT ? FS_FILE_USERABORT : FS_FILE_READERROR;
+            const int putRc = SftpUploadFileW(serverid2, tempFile.data(), newdir.c_str(), false, true, true);
+            if (putRc != SFTP_OK) return putRc == SFTP_ABORT ? FS_FILE_USERABORT : FS_FILE_WRITEERROR;
+            if (Move && SftpDeleteFileW(serverid1, olddir.c_str(), false) != SFTP_OK)
+                return FS_FILE_WRITEERROR;
+            return FS_FILE_OK;
+        }
+
         // LAN Pair rename.
         if (IsLanPairTransport(serverid1)) {
+            if (!Move) return FS_FILE_NOTSUPPORTED;
             if (!serverid1->lanSession || !serverid1->lanSession->isConnected()) return FS_FILE_WRITEERROR;
             const std::string oldUtf8 = LanRemotePathToUtf8(olddir.data());
             const std::string newUtf8 = LanRemotePathToUtf8(newdir.data());
-            return serverid1->lanSession->rename(oldUtf8, newUtf8) ? FS_FILE_OK : FS_FILE_WRITEERROR;
+            int result = FS_FILE_WRITEERROR;
+            serverid1->lanSession->rename(oldUtf8, newUtf8, !!OverWrite, &result);
+            return result;
         }
 
         int rc = SftpRenameMoveFileW(serverid1, olddir.data(), newdir.data(), !!Move, !!OverWrite, isdir);
@@ -386,7 +418,7 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
 
         // PHP Agent TAR batch download: queue single file instead of downloading individually.
         if (ri && !(ri->Attr & FILE_ATTRIBUTE_DIRECTORY) &&
-            IsPhpAgentTransport(serverid) && serverid->php_tar &&
+            !Move && IsPhpAgentTransport(serverid) && serverid->php_tar &&
             TarDownloadSessionIsActive(serverid))
         {
             if (TarDownloadSessionQueue(serverid, LocalName, remotedir.data()))
@@ -395,7 +427,7 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
 
         // PHP Agent TAR directory download.
         if (ri && (ri->Attr & FILE_ATTRIBUTE_DIRECTORY) &&
-            IsPhpAgentTransport(serverid) && serverid->php_tar)
+            !Move && IsPhpAgentTransport(serverid) && serverid->php_tar)
         {
             CreateDirectoryW(LocalName, nullptr);
             const int rc = PhpAgentDownloadDirAsTar(serverid, remotedir.data(), LocalName, OverWrite);
@@ -419,21 +451,36 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
             if (fsResult == FS_FILE_READERROR || fsResult == FS_FILE_WRITEERROR || fsResult == FS_FILE_NOTFOUND)
                 return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
                                                 fsResult, removeFailedDownload);
+            if (fsResult == FS_FILE_OK && Move && !RequestedResume &&
+                !serverid->lanSession->remove(remoteUtf8)) return FS_FILE_WRITEERROR;
             return fsResult;
         }
 
+        int64_t previousPartialSize = -1;
         while (true) {  // auto-resume loop
             int rc = SftpDownloadFileW(serverid, remotedir.data(), LocalName, true, ri->Size64, &ri->LastWriteTime, Resume);
             SFTP_LOG("ENTRY", "FsGetFileW SftpDownloadFileW rc=%d", rc);
             switch (rc) {
-                case SFTP_OK:          return FS_FILE_OK;
+                case SFTP_OK:
+                    if (Move && !Resume && SftpDeleteFileW(serverid, remotedir.data(), false) != SFTP_OK)
+                        return FS_FILE_WRITEERROR;
+                    if (Move && Resume) ShowStatus("Resumed move kept its source.");
+                    return FS_FILE_OK;
                 case SFTP_EXISTS:      return FS_FILE_EXISTS;
                 case SFTP_READFAILED:  return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
                                                                        FS_FILE_READERROR, removeFailedDownload);
                 case SFTP_WRITEFAILED: return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
                                                                        FS_FILE_WRITEERROR, removeFailedDownload);
                 case SFTP_ABORT:       return FS_FILE_USERABORT;
-                case SFTP_PARTIAL:     Resume = true; break;
+                case SFTP_PARTIAL: {
+                    WIN32_FILE_ATTRIBUTE_DATA data{};
+                    if (!GetFileAttributesExW(LocalName, GetFileExInfoStandard, &data)) return FS_FILE_READERROR;
+                    const int64_t size = (static_cast<int64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+                    if (size <= previousPartialSize) return FS_FILE_READERROR;
+                    previousPartialSize = size;
+                    Resume = true;
+                    break;
+                }
                 default:               return HandleBatchDownloadError(RemoteName, LocalName, Move, RequestedResume,
                                                                        FS_FILE_READERROR, removeFailedDownload);
             }
@@ -496,11 +543,12 @@ int WINAPI FsPutFileW(LPCWSTR LocalName, LPCWSTR RemoteName, int CopyFlags)
             const std::string remoteUtf8 = LanRemotePathToUtf8(remotedir.data());
             int fsResult = FS_FILE_WRITEERROR;
             serverid->lanSession->putFile(LocalName, remoteUtf8, OverWrite, Resume, &fsResult);
+            if (fsResult == FS_FILE_OK && Move && !Resume && !DeleteFileW(LocalName)) return FS_FILE_WRITEERROR;
             return fsResult;
         }
 
         // PHP Agent TAR batch upload: queue file into session, send all as one TAR at FsStatusInfo END.
-        if (IsPhpAgentTransport(serverid) && serverid->php_tar && TarUploadSessionIsActive()) {
+        if (!Move && IsPhpAgentTransport(serverid) && serverid->php_tar && TarUploadSessionIsActive()) {
             // Fill in cs on first file if session was started without one (PUT_MULTI_THREAD).
             if (!TarUploadSessionIsActive(serverid))
                 TarUploadSessionBegin(serverid);
@@ -518,7 +566,10 @@ int WINAPI FsPutFileW(LPCWSTR LocalName, LPCWSTR RemoteName, int CopyFlags)
         int rc = SftpUploadFileW(serverid, LocalName, remotedir.data(), Resume, setattr);
         SFTP_LOG("ENTRY", "FsPutFileW SftpUploadFileW rc=%d", rc);
         switch (rc) {
-            case SFTP_OK:          return FS_FILE_OK;
+            case SFTP_OK:
+                if (Move && !Resume && !DeleteFileW(LocalName)) return FS_FILE_WRITEERROR;
+                if (Move && Resume) ShowStatus("Resumed move kept its source.");
+                return FS_FILE_OK;
             case SFTP_EXISTS:      return SftpSupportsResume(serverid) ? FS_FILE_EXISTSRESUMEALLOWED : FS_FILE_EXISTS;
             case SFTP_READFAILED:  return FS_FILE_READERROR;
             case SFTP_WRITEFAILED: return FS_FILE_WRITEERROR;

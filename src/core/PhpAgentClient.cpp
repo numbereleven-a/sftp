@@ -971,6 +971,16 @@ int PhpAgentCreateDirectoryW(pConnectSettings cs, LPCWSTR remoteDirW)
     return SFTP_OK;
 }
 
+int PhpAgentFileExistsW(pConnectSettings cs, LPCWSTR path)
+{
+    const std::string utf8 = NormalizePhpRemotePath(cs, path);
+    DWORD code = 0;
+    if (SendSimpleRequest(cs, L"GET", L"STAT", BuildQueryPathOnly(L"STAT", utf8),
+                          nullptr, 0, &code, nullptr, utf8.c_str()) != SFTP_OK)
+        return -1;
+    return IsHttpSuccess(code) ? 1 : code == 404 ? 0 : -1;
+}
+
 int PhpAgentRenameMoveFileW(pConnectSettings cs, LPCWSTR oldNameW, LPCWSTR newNameW, bool overwrite)
 {
     std::string oldUtf8 = NormalizePhpRemotePath(cs, oldNameW);

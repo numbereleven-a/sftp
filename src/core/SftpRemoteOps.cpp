@@ -17,6 +17,7 @@
 #include "UnicodeHelpers.h"
 #include "FtpDirectoryParser.h"
 #include "SftpInternal.h"
+#include "TransferUtils.h"
 #include "PhpAgentClient.h"
 
 namespace {
@@ -212,15 +213,13 @@ int SftpFindFirstFileW(pConnectSettings cs, LPCWSTR remotedir, LPVOID* davdatapt
             cs->scpShellErrBuf.clear();
 
             std::string listTarget = dirStr;
-            if (!listTarget.empty() && listTarget[0] == '/')
-                listTarget = (listTarget.size() == 1) ? "." : listTarget.substr(1);
 
             static unsigned scpListSeq = 1;
             const unsigned markerSeq = scpListSeq++;
             std::string beginMarker = std::string(kScpListBeginMarker) + "_" + std::to_string(markerSeq);
             std::string endMarker   = std::string(kScpListEndMarker)   + "_" + std::to_string(markerSeq);
 
-            std::string command = "echo \"" + beginMarker + "\"; ls -la '" + string_util::ShellQuoteSingle(listTarget) +
+            std::string command = "echo \"" + beginMarker + "\"; LC_ALL=C TZ=UTC QUOTING_STYLE=literal ls -la '" + string_util::ShellQuoteSingle(listTarget) +
                                   "'; echo \"" + endMarker + "\":$?\n";
 
             // Write command
@@ -260,7 +259,9 @@ int SftpFindFirstFileW(pConnectSettings cs, LPCWSTR remotedir, LPVOID* davdatapt
             }
 
             std::vector<std::string> lines;
-            bool gotEnd = ScpReadCommandOutput(cs, endMarker.c_str(), lines, kScpReadTimeoutMs, beginMarker.c_str());
+            std::string endLine;
+            bool gotEnd = ScpReadCommandOutput(cs, endMarker.c_str(), lines, kScpReadTimeoutMs, beginMarker.c_str(), &endLine);
+            if (endLine != endMarker + ":0") gotEnd = false;
 
             std::vector<WIN32_FIND_DATAW> entries;
             for (const auto& line : lines) {
@@ -498,8 +499,6 @@ int SftpCreateDirectoryW(pConnectSettings cs, LPCWSTR Path)
         }
 
         std::string target = dirStr;
-        if (!target.empty() && target[0] == '/')
-            target = (target.size() == 1) ? "." : target.substr(1);
         
         std::string cmd = "mkdir '" + string_util::ShellQuoteSingle(target) + "'";
         bool ok = GetChannelCommandReply(cs->session.get(), channel.get(), cmd.c_str(), cs->sock);
@@ -572,21 +571,22 @@ int SftpDeleteFileW(pConnectSettings cs, LPCWSTR RemoteName, bool isdir)
     if (IsPhpAgentTransport(cs))
         return PhpAgentDeleteFileW(cs, RemoteName, isdir);
 
-    if (nameStr == "/~")
+    // Reject root and dot components before constructing a destructive command.
+    std::string_view leaf(nameStr);
+    while (!leaf.empty() && leaf.back() == '/') leaf.remove_suffix(1);
+    leaf = leaf.substr(leaf.find_last_of('/') == std::string_view::npos ? 0 : leaf.find_last_of('/') + 1);
+    if (leaf.empty() || leaf == "." || leaf == ".." || nameStr == "/~" || nameStr == "~")
         return SFTP_FAILED;
 
     if (cs->scponly) {
         std::string target = nameStr;
-        if (!target.empty() && target[0] == '/')
-            target = (target.size() == 1) ? "." : target.substr(1);
-
-        std::string cmd = isdir ? "rm -rf '" : "rm -f '";
+        std::string cmd = isdir ? "rmdir -- '" : "rm -f -- '";
         cmd += string_util::ShellQuoteSingle(target) + "'";
 
         if (!EnsureScpShell(cs))
             return SFTP_FAILED;
 
-        std::string fullCmd = cmd + "; echo \"" + kScpListEndMarker + "\":$?\n";
+        std::string fullCmd = std::string("echo \"") + kScpListBeginMarker + "\"; " + cmd + "; echo \"" + kScpListEndMarker + "\":$?\n";
         ISshChannel* channel = cs->scpShellChannel.get();
         const auto writeStart = std::chrono::steady_clock::now();
         size_t written = 0;
@@ -606,14 +606,9 @@ int SftpDeleteFileW(pConnectSettings cs, LPCWSTR RemoteName, bool isdir)
         }
 
         std::vector<std::string> lines;
-        bool gotEnd = ScpReadCommandOutput(cs, kScpListEndMarker, lines, kScpDeleteReadTimeoutMs);
-        int exitCode = 0;
-        for (const auto& l : lines) {
-            size_t p = l.find(kScpListEndMarker);
-            if (p != std::string::npos && p + strlen(kScpListEndMarker) < l.size() && l[p + strlen(kScpListEndMarker)] == ':')
-                exitCode = atoi(l.c_str() + p + strlen(kScpListEndMarker) + 1);
-        }
-        return (gotEnd && exitCode == 0) ? SFTP_OK : SFTP_FAILED;
+        std::string endLine;
+        bool gotEnd = ScpReadCommandOutput(cs, kScpListEndMarker, lines, kScpDeleteReadTimeoutMs, kScpListBeginMarker, &endLine);
+        return (gotEnd && endLine == std::string(kScpListEndMarker) + ":0") ? SFTP_OK : SFTP_FAILED;
     }
 
     const SYSTICKS start = get_sys_ticks();
@@ -648,6 +643,31 @@ int SftpDeleteFileW(pConnectSettings cs, LPCWSTR RemoteName, bool isdir)
     return SFTP_FAILED;
 }
 
+int SftpFileExistsW(pConnectSettings cs, LPCWSTR path)
+{
+    if (!cs) return -1;
+    if (IsPhpAgentTransport(cs)) return PhpAgentFileExistsW(cs, path);
+    if (cs->scponly) {
+        std::wstring unixPath(path);
+        std::replace(unixPath.begin(), unixPath.end(), L'\\', L'/');
+        const std::wstring quoted = L"'" + string_util::ShellQuoteSingleW(unixPath) + L"'";
+        const size_t slash = unixPath.find_last_of('/');
+        const std::wstring parent = slash == std::wstring::npos ? L"." : slash == 0 ? L"/" : unixPath.substr(0, slash);
+        const std::wstring parentArg = L"'" + string_util::ShellQuoteSingleW(parent) + L"'";
+        const std::wstring cmd = L"if test -e " + quoted + L" || test -L " + quoted +
+            L"; then exit 0; else test -d " + parentArg + L" && test -r " + parentArg +
+            L" && test -x " + parentArg + L" && exit 1; exit 2; fi";
+        const int rc = SftpQuoteCommand2W(cs, nullptr, cmd.c_str(), nullptr, 0);
+        return rc == 0 ? 1 : rc == 1 ? 0 : -1;
+    }
+    if (!cs->sftpsession) return -1;
+    const std::string remote = ToRemotePathA(cs, path);
+    LIBSSH2_SFTP_ATTRIBUTES attrs{};
+    const int rc = WaitForOperation([&] { return cs->sftpsession->lstat(remote.c_str(), &attrs); }, 15000, cs);
+    if (rc == 0) return 1;
+    return rc == LIBSSH2_ERROR_SFTP_PROTOCOL && cs->sftpsession->lastError() == LIBSSH2_FX_NO_SUCH_FILE ? 0 : -1;
+}
+
 int SftpRenameMoveFileW(pConnectSettings cs, LPCWSTR OldName, LPCWSTR NewName, bool Move, bool Overwrite, [[maybe_unused]] bool isdir)
 {
     if (!cs)
@@ -664,11 +684,18 @@ int SftpRenameMoveFileW(pConnectSettings cs, LPCWSTR OldName, LPCWSTR NewName, b
     ReplaceBackslashBySlash(newNameA.data());
 
     if (cs->scponly) {
+        if (!Overwrite) {
+            const int exists = SftpFileExistsW(cs, NewName);
+            if (exists != 0) return exists > 0 ? SFTP_EXISTS : SFTP_FAILED;
+        }
+        std::wstring oldW(OldName), newW(NewName);
+        std::replace(oldW.begin(), oldW.end(), L'\\', L'/');
+        std::replace(newW.begin(), newW.end(), L'\\', L'/');
         std::wstring cmdW = Move ? L"mv '" : L"cp '";
-        cmdW += string_util::ShellQuoteSingleW(OldName) + L"' '";
-        cmdW += string_util::ShellQuoteSingleW(NewName) + L"'";
+        cmdW += string_util::ShellQuoteSingleW(oldW) + L"' '";
+        cmdW += string_util::ShellQuoteSingleW(newW) + L"'";
         const int rc = SftpQuoteCommand2W(cs, nullptr, cmdW.c_str(), nullptr, 0);
-        return (rc >= 0) ? SFTP_OK : SFTP_FAILED;
+        return (rc == 0) ? SFTP_OK : SFTP_FAILED;
     }
 
     if (!Overwrite) {
@@ -679,8 +706,9 @@ int SftpRenameMoveFileW(pConnectSettings cs, LPCWSTR OldName, LPCWSTR NewName, b
             if (lrc == LIBSSH2_ERROR_EAGAIN)
                 WaitForSshIo(cs);
         } while (lrc == LIBSSH2_ERROR_EAGAIN);
-        if (lrc >= 0)
-            return SFTP_EXISTS;
+        if (lrc >= 0) return SFTP_EXISTS;
+        if (cs->sftpsession->lastError() != LIBSSH2_FX_NO_SUCH_FILE)
+            return SFTP_FAILED;
     }
 
     int rc = 0;
@@ -778,12 +806,29 @@ bool SftpChmodW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR chmod)
     if (!cs || !RemoteName || !chmod || !chmod[0])
         return false;
 
+    unsigned long mode = 0;
+    for (const wchar_t* p = chmod; *p; ++p) {
+        if (*p < L'0' || *p > L'7') return false;
+        mode = mode * 8 + (*p - L'0');
+        if (mode > 07777) return false;
+    }
+    if (IsPhpAgentTransport(cs)) return false;
+    const std::string pathA = ToRemotePathA(cs, RemoteName);
+    if (!cs->scponly) {
+        if (!cs->sftpsession) return false;
+        LIBSSH2_SFTP_ATTRIBUTES attrs{};
+        attrs.flags = LIBSSH2_SFTP_ATTR_PERMISSIONS;
+        attrs.permissions = mode;
+        return WaitForOperation([&] { return cs->sftpsession->setstat(pathA.c_str(), &attrs); }, 15000, cs) == 0;
+    }
+    std::wstring pathW(RemoteName);
+    std::replace(pathW.begin(), pathW.end(), L'\\', L'/');
     std::wstring cmd = L"chmod ";
     cmd += chmod;
     cmd += L" '";
-    cmd += string_util::ShellQuoteSingleW(RemoteName);
+    cmd += string_util::ShellQuoteSingleW(pathW);
     cmd += L"'";
-    return SftpQuoteCommand2W(cs, nullptr, cmd.c_str(), nullptr, 0) >= 0;
+    return SftpQuoteCommand2W(cs, nullptr, cmd.c_str(), nullptr, 0) == 0;
 }
 
 bool SftpLinkFolderTargetW(pConnectSettings cs, LPWSTR RemoteName, size_t maxlen)

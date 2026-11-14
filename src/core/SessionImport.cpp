@@ -1,5 +1,6 @@
 #include "global.h"
 #include "SessionImport.h"
+#include "PluginEntryPoints.h"
 #include "KittyDecrypt.h"
 #include "WindowsUserFeedback.h"
 #include "SftpInternal.h"
@@ -282,6 +283,16 @@ bool ImportSessionToIni(const SessionDescriptor& session, LPCSTR iniFileName, bo
         }
     }
 
+    DWORD proxyMethod = 0, tunnel = 0;
+    ReadRegDword(sessionKey, "ProxyMethod", proxyMethod);
+    ReadRegDword(sessionKey, "Tunnel", tunnel);
+    if (proxyMethod != 0 || tunnel != 0) {
+        RegCloseKey(sessionKey);
+        unsupportedProtocol = true;
+        ShowStatus("Import skipped: configure the proxy or jump host manually before connecting.");
+        return false;
+    }
+
     DWORD port = 0;
     const bool hasPort = ReadRegDword(sessionKey, "PortNumber", port);
 
@@ -520,6 +531,14 @@ bool ImportPortableSessionToIni(const PortableSessionDescriptor& session, LPCSTR
         }
     }
 
+    DWORD proxyMethod = 0, tunnel = 0;
+    ReadIniDword(src, sect, "ProxyMethod", proxyMethod);
+    ReadIniDword(src, sect, "Tunnel", tunnel);
+    if (proxyMethod != 0 || tunnel != 0) {
+        unsupportedProtocol = true;
+        ShowStatus("Import skipped: configure the proxy or jump host manually before connecting.");
+        return false;
+    }
     DWORD port = 0;
     const bool hasPort = ReadIniDword(src, sect, "PortNumber", port);
 
@@ -1154,6 +1173,12 @@ static bool ImportKittySessionToIni(const KittySessionDescriptor& session,
     std::string host;
     if (!ReadKittyString(session.filePath, "HostName", host) || host.empty())
         return false;
+
+    std::string proxyMethod;
+    if (ReadKittyString(session.filePath, "ProxyMethod", proxyMethod) && proxyMethod != "0") {
+        ShowStatus("Import skipped: configure the proxy manually before connecting.");
+        return false;
+    }
 
     std::string portStr;
     DWORD port = 0;

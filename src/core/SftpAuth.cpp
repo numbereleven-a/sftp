@@ -22,11 +22,12 @@ static bool PromptLooksLikePasswordRequest(char* promptTextLower) noexcept
 {
     if (!promptTextLower || !promptTextLower[0])
         return false;
-    // Must contain "pass".
-    if (!strstr(promptTextLower, "pass"))
+    if (!strstr(promptTextLower, "password"))
         return false;
     // Exclude common OTP prompts.
-    if (strstr(promptTextLower, "oath") || strstr(promptTextLower, "one time") || strstr(promptTextLower, "one-time"))
+    if (strstr(promptTextLower, "oath") || strstr(promptTextLower, "otp") ||
+        strstr(promptTextLower, "one time") || strstr(promptTextLower, "one-time") ||
+        strstr(promptTextLower, "verification") || strstr(promptTextLower, "passcode"))
         return false;
     return true;
 }
@@ -63,11 +64,10 @@ void kbd_callback(LPCSTR name, int name_len,
         memcpy(retbuf.data(), prompts[i].text, copyLen);
         retbuf[copyLen] = '\0';
         ShowStatus(retbuf.data());
-        bool autoSendPassword = (ConnectSettings && !ConnectSettings->password.empty() && !ConnectSettings->InteractivePasswordSent);
-        if (autoSendPassword) {
-            _strlwr_s(retbuf.data(), retbuf.size());
-            autoSendPassword = PromptLooksLikePasswordRequest(retbuf.data());
-        }
+        _strlwr_s(retbuf.data(), retbuf.size());
+        const bool passwordPrompt = PromptLooksLikePasswordRequest(retbuf.data());
+        bool autoSendPassword = passwordPrompt && ConnectSettings &&
+            !ConnectSettings->password.empty() && !ConnectSettings->InteractivePasswordSent;
         if (autoSendPassword) {
             ConnectSettings->InteractivePasswordSent = true;
             std::string secondPassword;
@@ -106,7 +106,7 @@ void kbd_callback(LPCSTR name, int name_len,
                 responses[i].text = _strdup(retbuf.data());
                 responses[i].length = (unsigned int)strlen(retbuf.data());
                 // Remember password for background transfers
-                if (ConnectSettings && ConnectSettings->password.empty())
+                if (passwordPrompt && ConnectSettings && ConnectSettings->password.empty())
                     ConnectSettings->password = retbuf.data();
                 ShowStatusId(IDS_LOG_SEND_USER_PASS, nullptr, true);
             } else {

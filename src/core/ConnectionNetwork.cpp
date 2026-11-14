@@ -116,6 +116,7 @@ bool InitializeSftpSubsystemIfNeeded(pConnectSettings ConnectSettings, int progr
         ShowStatus(("Custom SFTP server command: " + ConnectSettings->sftpservercommand).c_str());
     }
     ShowStatusId(IDS_SESSION_STARTUP, " (SFTP)", true);
+    const auto initStart = get_sys_ticks();
     do {
         ConnectSettings->sftpsession = nullptr;
         if (ProgressLoop(buf.data(), progress, progress + 10, loop, lasttime))
@@ -128,7 +129,11 @@ bool InitializeSftpSubsystemIfNeeded(pConnectSettings ConnectSettings, int progr
         } else if (ConnectSettings->session->lastErrno() != LIBSSH2_ERROR_EAGAIN) {
             break;
         }
-        IsSocketReadable(ConnectSettings->sock);
+        if (get_ticks_between(initStart) > 15000) {
+            ShowStatus("SFTP initialization timed out. For a shell-only server, select Use SCP for everything.");
+            break;
+        }
+        WaitForSshIo(ConnectSettings);
     } while (!ConnectSettings->sftpsession);
 
     if (!ConnectSettings->sftpsession) {

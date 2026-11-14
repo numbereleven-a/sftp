@@ -265,13 +265,16 @@ if (Test-Path $vcToolsRoot) {
 
 # Validate VC tools version
 if ($vcToolsVersion) {
-    $minimumVcToolsVersion = [version]"14.50.0.0"
+    $minimumVcToolsVersion = [version]"14.44.0.0"
     $currentVcToolsVersion = [version]("$vcToolsVersion.0")
     if ($currentVcToolsVersion -lt $minimumVcToolsVersion) {
-        Write-Error "VC tools $vcToolsVersion detected. Version 14.50 or later required."
+        Write-Error "VC tools $vcToolsVersion detected. Version 14.44 or later required."
         exit 1
     }
 }
+$platformToolset = if ($currentVcToolsVersion -ge [version]'14.50.0.0') { 'v145' } else { 'v143' }
+$architectures = if ($x64only) { @('x64') } else { @('x64', 'x86') }
+& (Join-Path $projectRoot 'build-libssh2.ps1') -VisualStudioPath $vsPath -Architecture $architectures
 
 # ============================================================================
 # Step 2: Prepare directories
@@ -301,7 +304,7 @@ $msBuildBase = @(
     $vcxprojPath,
     "/t:Rebuild",
     "/p:Configuration=Release",
-    "/p:PlatformToolset=v145",
+    "/p:PlatformToolset=$platformToolset",
     "/p:WindowsTargetPlatformVersion=10.0",
     "/p:DebugSymbols=false",
     "/p:DebugType=none",
@@ -343,8 +346,7 @@ if (-not $x64only) {
     Write-Host "  Skipping x86 build (-x64only)" -ForegroundColor Gray
 }
 
-# Clean intermediate files
-Clean-BuildOutput
+# Keep intermediates available to tests/run-ssh-tests.ps1.
 
 # ============================================================================
 # Step 4: Compile CHM (if requested)
