@@ -525,6 +525,56 @@ int WINAPI FsInit(int PluginNr, tProgressProc pProgressProc, tLogProc pLogProc, 
     });
 }
 
+// A Unicode host may initialise the plugin through FsInitW alone. Much of
+// the plugin still reports through the ANSI callbacks, so until the host
+// supplies those (FsInit replaces these adapters), they convert and forward
+// to the Unicode ones instead of being null.
+namespace {
+
+std::wstring AnsiToWide(LPCSTR s)
+{
+    if (!s || !*s)
+        return {};
+    const int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+    std::wstring w(static_cast<size_t>(n > 0 ? n : 0), L'\0');
+    if (n > 0) {
+        MultiByteToWideChar(CP_ACP, 0, s, -1, w.data(), n);
+        w.pop_back();
+    }
+    return w;
+}
+
+int WINAPI ProgressAnsiToWide(int nr, LPCSTR source, LPCSTR target, int percent)
+{
+    return ProgressProcW ? ProgressProcW(nr, AnsiToWide(source).c_str(), AnsiToWide(target).c_str(), percent) : 0;
+}
+
+void WINAPI LogAnsiToWide(int nr, int type, LPCSTR text)
+{
+    if (LogProcW)
+        LogProcW(nr, type, AnsiToWide(text).c_str());
+}
+
+BOOL WINAPI RequestAnsiToWide(int nr, int type, LPCSTR title, LPCSTR text, LPSTR returned, int maxlen)
+{
+    if (!RequestProcW)
+        return FALSE;
+    std::wstring answer = returned && maxlen > 0 ? AnsiToWide(returned) : std::wstring();
+    answer.resize(static_cast<size_t>(maxlen > 0 ? maxlen : 1), L'\0');
+    const BOOL ok = RequestProcW(nr, type, title ? AnsiToWide(title).c_str() : nullptr,
+                                 text ? AnsiToWide(text).c_str() : nullptr,
+                                 returned ? answer.data() : nullptr, maxlen);
+    if (ok && returned && maxlen > 0) {
+        if (WideCharToMultiByte(CP_ACP, 0, answer.c_str(), -1, returned, maxlen, nullptr, nullptr) == 0)
+            returned[0] = '\0';
+        returned[maxlen - 1] = '\0';
+    }
+    SecureZeroMemory(answer.data(), answer.size() * sizeof(wchar_t));
+    return ok;
+}
+
+} // namespace
+
 int WINAPI FsInitW(int PluginNr, tProgressProcW pProgressProcW, tLogProcW pLogProcW, tRequestProcW pRequestProcW)
 {
     sftp::DllExceptionBarrier _barrier;
@@ -532,6 +582,9 @@ int WINAPI FsInitW(int PluginNr, tProgressProcW pProgressProcW, tLogProcW pLogPr
         ProgressProcW = pProgressProcW;
         LogProcW = pLogProcW;
         RequestProcW = pRequestProcW;
+        if (!ProgressProc) ProgressProc = ProgressAnsiToWide;
+        if (!LogProc) LogProc = LogAnsiToWide;
+        if (!RequestProc) RequestProc = RequestAnsiToWide;
         return _FsInit(PluginNr);
     });
 }

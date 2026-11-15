@@ -148,6 +148,7 @@
   </ItemDefinitionGroup>
   <!-- Source Files -->
   <ItemGroup>
+    <ClCompile Include="..\src\core\TerminalText.cpp" />
     <ClCompile Include="..\src\core\UnicodeHelpers.cpp" />
     <ClCompile Include="..\src\core\UtfConversion.cpp" />
     <ClCompile Include="..\src\core\ServerRegistry.cpp" />
@@ -200,6 +201,7 @@
     <ClInclude Include="..\src\include\UtfConversion.h" />
     <ClInclude Include="..\src\include\fsplugin.h" />
     <ClInclude Include="..\src\include\FtpDirectoryParser.h" />
+    <ClInclude Include="..\src\include\TerminalText.h" />
     <ClInclude Include="..\src\include\global.h" />
     <ClInclude Include="..\src\include\ServerRegistry.h" />
     <ClInclude Include="..\src\include\SftpClient.h" />

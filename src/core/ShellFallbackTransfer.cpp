@@ -19,6 +19,7 @@
 // Keep command length safely below shell line limits on restricted hosts.
 // 1024 bytes -> 1368 base64 chars (+ command overhead).
 static constexpr size_t SHELL_DD_UPLOAD_CHUNK_BYTES  = 1024;
+static constexpr size_t SHELL_DD_UPLOAD_LARGE_CHUNK = 48 * 1024;
 static constexpr size_t SHELL_DD_DOWNLOAD_BLOCK      = 65536;
 
 #define SHELL_DD_LOG(fmt, ...) SFTP_LOG("SHELL_DD", fmt, ##__VA_ARGS__)
@@ -553,7 +554,31 @@ static int ShellDdUploadRaw(
     return SFTP_OK;
 }
 
-// ---- base64 upload: one channel per chunk via printf | base64 -d ----
+// ---- base64 upload: one command per chunk via printf | base64 -d ----
+
+static bool ShellTakesMultiLineBase64(pConnectSettings cs)
+{
+    std::vector<std::string> output;
+    if (!ShellExecPersistentCollectLines(cs, "printf '%s' 'QUJD\nREVG' | base64 -d | wc -c", output))
+        return false;
+    for (const auto& line : output) {
+        const char* text = ShellTrimLeft(line.c_str());
+        if (text[0] == '6' && (text[1] == '\0' || static_cast<unsigned char>(text[1]) <= ' '))
+            return true;
+    }
+    return false;
+}
+
+static std::string ShellB64WrapLines(std::string_view encoded)
+{
+    std::string result;
+    result.reserve(encoded.size() + encoded.size() / 76);
+    for (size_t i = 0; i < encoded.size(); i += 76) {
+        if (i) result += '\n';
+        result.append(encoded.substr(i, 76));
+    }
+    return result;
+}
 
 static int ShellDdUploadBase64(
     pConnectSettings cs,
@@ -577,7 +602,6 @@ static int ShellDdUploadBase64(
     }
 
     bool firstChunk = (alignedResume == 0);
-    std::vector<uint8_t> readBuf(SHELL_DD_UPLOAD_CHUNK_BYTES);
     const SYSTICKS starttime = get_sys_ticks();
     DWORD bytesRead = 0;
 
@@ -586,8 +610,14 @@ static int ShellDdUploadBase64(
         return SFTP_FAILED;
     }
 
-    while (ReadFile(localfile, readBuf.data(), (DWORD)SHELL_DD_UPLOAD_CHUNK_BYTES, &bytesRead, nullptr) && bytesRead > 0) {
+    const bool multiLine = fileSize - alignedResume > static_cast<int64_t>(SHELL_DD_UPLOAD_CHUNK_BYTES) &&
+        ShellTakesMultiLineBase64(cs);
+    const size_t chunkBytes = multiLine ? SHELL_DD_UPLOAD_LARGE_CHUNK : SHELL_DD_UPLOAD_CHUNK_BYTES;
+    std::vector<uint8_t> readBuf(chunkBytes);
+
+    while (ReadFile(localfile, readBuf.data(), static_cast<DWORD>(chunkBytes), &bytesRead, nullptr) && bytesRead > 0) {
         std::string b64 = ShellB64Encode(std::span<const uint8_t>(readBuf.data(), bytesRead));
+        if (multiLine) b64 = ShellB64WrapLines(b64);
 
         // ">" truncates/creates on the first chunk; ">>" appends on all subsequent ones.
         const char* redirect = firstChunk ? ">" : ">>";

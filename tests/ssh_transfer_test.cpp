@@ -26,6 +26,31 @@ BOOL WINAPI request(int, int type, LPCSTR, LPCSTR, LPSTR result, int length) {
     if (type == RT_Password && result) { strlcpy(result, response.c_str(), length); return TRUE; }
     return FALSE;
 }
+int WINAPI progressW(int, LPCWSTR, LPCWSTR, int percent) { return percent; }
+void WINAPI logW(int, int, LPCWSTR) {}
+BOOL WINAPI requestW(int, int type, LPCWSTR, LPCWSTR, LPWSTR result, int length) {
+    if (type == RT_Password && result) {
+        const std::wstring value(response.begin(), response.end());
+        wcsncpy_s(result, length, value.c_str(), _TRUNCATE);
+        return TRUE;
+    }
+    return FALSE;
+}
+void terminalControls() {
+    for (const auto& [input, expected] : std::initializer_list<std::pair<const char*, const char*>>{
+        {"\x1b[31mred\x1b[0m text", "red text"},
+        {"\x1b[?2004hfilename.bin", "filename.bin"},
+        {"\x1b]3008;context\x07" "filename.bin", "filename.bin"},
+        {"\x1b]0;title\x1b\\filename.bin", "filename.bin"},
+        {"\x1bPprivate\x1b\\filename.bin", "filename.bin"},
+        {"\x1b(Bfilename.bin", "filename.bin"},
+        {"\x1b[?2004h\xD0\xB8\xD0\xBC\xD1\x8F.bin", "\xD0\xB8\xD0\xBC\xD1\x8F.bin"},
+        {"plain \\141.bin", "plain a.bin"}}) {
+        std::string text(input);
+        StripEscapeSequences(text.data());
+        check(text.c_str() == std::string(expected), "terminal control filter preserves payload");
+    }
+}
 std::string readFile(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(file), {}};
@@ -101,6 +126,18 @@ void imports(const std::filesystem::path& root) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    if (argc == 2) {
+        IsolatedAppData isolated;
+        if (std::wstring_view(argv[1]) == L"--terminal") terminalControls();
+        else if (std::wstring_view(argv[1]) == L"--unicode-init") {
+            FsInitW(42, progressW, logW, requestW);
+            check(ProgressProc && LogProc && RequestProc, "Unicode-only initialization supplies ANSI bridges");
+            authPrompts();
+            check(ProgressProc(42, "source", "target", 37) == 37, "progress bridge preserves callback result");
+        } else return 2;
+        return failures ? 1 : 0;
+    }
     if (argc != 3 && argc != 4) return 2;
     IsolatedAppData isolated;
     const std::filesystem::path root(argv[2]);
@@ -199,6 +236,14 @@ int wmain(int argc, wchar_t** argv) {
           !std::filesystem::exists(special) && readFile(shellRoot / "renamed.bin") == bytes, "shell rename uses Unix paths and checks exit status");
     check(SftpUploadFileW(shell, local.c_str(), (shellRoot / "missing" / "failure.bin").c_str(), false, false) != SFTP_OK,
           "shell upload failure is not reported as success");
+    std::string largeData(96 * 1024 + 7, '\0');
+    for (size_t i = 0; i < largeData.size(); ++i) largeData[i] = static_cast<char>(i * 73);
+    writeFile(local, largeData);
+    const auto resumedLarge = shellRoot / "resumed-large.bin";
+    writeFile(resumedLarge, largeData.substr(0, 2));
+    check(SftpUploadFileW(shell, local.c_str(), resumedLarge.c_str(), true, false) == SFTP_OK && readFile(resumedLarge) == largeData,
+          "multiline shell upload resumes at an exact byte offset across chunk boundaries");
+    writeFile(local, bytes);
     if (argc == 4) {
         auto* php = new tConnectSettings{};
         php->transfermode = static_cast<int>(sftp::TransferMode::php_agent);

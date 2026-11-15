@@ -99,10 +99,12 @@ def receive_line(channel):
 
 
 class Peer(paramiko.ServerInterface):
-    def __init__(self, root, shell):
+    def __init__(self, root, shell, delay=0):
         self.root = root
         self.shell = shell
         self.modes = {}
+        self.delay = delay
+        self.command_count = 0
 
     def check_auth_password(self, username, password):
         return paramiko.AUTH_SUCCESSFUL if (username, password) == ("synthetic", "synthetic-pass") else paramiko.AUTH_FAILED
@@ -136,9 +138,20 @@ class Peer(paramiko.ServerInterface):
                                    cwd=self.root, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
 
         def input_stream():
+            pending = b""
             try:
                 while data := channel.recv(4096):
-                    process.stdin.write(data)
+                    pending += data
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        if b'echo "__WFX_DD_BEGIN__' in line:
+                            self.command_count += 1
+                            if self.delay:
+                                time.sleep(self.delay)
+                        process.stdin.write(line + b"\n")
+                        process.stdin.flush()
+                if pending:
+                    process.stdin.write(pending)
                     process.stdin.flush()
             except (OSError, EOFError):
                 pass
@@ -218,6 +231,7 @@ def main():
     parser.add_argument("client", type=Path)
     parser.add_argument("--shell", type=Path, required=True)
     parser.add_argument("--php", type=Path)
+    parser.add_argument("--command-delay-ms", type=int, default=0)
     args = parser.parse_args()
     # The ephemeral peer key remains in memory throughout this test.
     key = paramiko.RSAKey.generate(2048)
@@ -233,6 +247,7 @@ def main():
         port = listener.getsockname()[1]
         stop = threading.Event()
         transports = []
+        peers = []
 
         def accept_loop():
             while not stop.is_set():
@@ -243,7 +258,9 @@ def main():
                 transport = paramiko.Transport(client)
                 transport.add_server_key(key)
                 transport.set_subsystem_handler("sftp", paramiko.SFTPServer, Files, root=remote)
-                transport.start_server(server=Peer(remote, args.shell.resolve()))
+                peer = Peer(remote, args.shell.resolve(), args.command_delay_ms / 1000)
+                peers.append(peer)
+                transport.start_server(server=peer)
                 transports.append(transport)
 
         accept = threading.Thread(target=accept_loop, daemon=True)
@@ -271,6 +288,8 @@ def main():
                         time.sleep(0.05)
                 client_args.append(str(php_port))
             result = subprocess.run(client_args, timeout=180)
+            if args.command_delay_ms:
+                print("Shell commands:", sum(peer.command_count for peer in peers))
             return result.returncode
         finally:
             if php:

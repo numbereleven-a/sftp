@@ -1,5 +1,17 @@
 # Release Notes
 
+## SFTPplug 10.2.5.3
+
+### Fixes
+
+- Fixed terminal control-sequence filtering in shell mode. Bracketed-paste switches, OSC records, and other escape sequences no longer discard valid output. UTF-8 filenames are preserved.
+- Fixed a crash when the host initializes the plugin through `FsInitW` only. ANSI callback adapters now forward password requests, progress updates, and log messages to the Unicode callbacks.
+
+### Improvements
+
+- Accelerated shell uploads with multiline base64 blocks of up to 48 KiB on compatible shells. Other shells retain the existing 1 KiB transfer path.
+- Preserved exact resume offsets across upload block boundaries.
+
 ## SFTPplug 10.2.5.2
 
 - Fixed file copies within a session and between SSH/PHP sessions, overwrite checks, and F6 source removal after successful transfers. Resumed moves retain their sources.

@@ -3,7 +3,8 @@ param(
     [ValidateSet('x64', 'x86')][string]$Architecture = 'x64',
     [string]$PythonPath = 'python.exe',
     [Parameter(Mandatory = $true)][string]$ShellPath,
-    [string]$PhpPath
+    [string]$PhpPath,
+    [switch]$BuildOnly
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -24,13 +25,23 @@ try {
         ForEach-Object { '"build/.intermediates/SFTPplug/{0}_Release/{1}"' -f $platform,$_.Name }
     if (!$objects) { throw 'Build the Release plugin before running SSH tests' }
     $objects | Set-Content "$output/ssh-objects.rsp" -Encoding ascii
-    $compile = 'call "{0}" >nul && cl /c /nologo /std:c++20 /EHsc /O2 /MT /GR- /FI global.h /DSFTP_ALLINONE /DLIBSSH2_API= /I src /I src/include tests/ssh_transfer_test.cpp /Fo:{2}/ssh_transfer_test.obj && link /nologo /OUT:{2}/ssh_transfer_test.exe /SUBSYSTEM:CONSOLE /LTCG /OPT:REF {2}/ssh_transfer_test.obj @{2}/ssh-objects.rsp /LIBPATH:src/lib libssh2_{1}.lib mbedcrypto_{1}.lib argon2_a_{1}.lib ws2_32.lib bcrypt.lib crypt32.lib winhttp.lib iphlpapi.lib shlwapi.lib advapi32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib comctl32.lib dbghelp.lib 2>&1' -f $VcVarsPath,$Architecture,$output
-    & $env:COMSPEC /d /s /c $compile
-    if ($LASTEXITCODE) { throw 'SSH integration test compilation failed' }
+    foreach ($test in @('ssh_transfer_test','shell_upload_bench')) {
+        $extra = if ($test -eq 'shell_upload_bench') { 'build/.intermediates/SFTPplug/{0}_Release/SessionImport.obj' -f $platform } else { '' }
+        $compile = 'call "{0}" >nul && cl /c /nologo /std:c++20 /EHsc /O2 /MT /GR- /FI global.h /DSFTP_ALLINONE /DLIBSSH2_API= /I src /I src/include tests/{3}.cpp /Fo:{2}/{3}.obj && link /nologo /OUT:{2}/{3}.exe /SUBSYSTEM:CONSOLE /LTCG /OPT:REF {2}/{3}.obj @{2}/ssh-objects.rsp {4} /LIBPATH:src/lib libssh2_{1}.lib mbedcrypto_{1}.lib argon2_a_{1}.lib ws2_32.lib bcrypt.lib crypt32.lib winhttp.lib iphlpapi.lib shlwapi.lib advapi32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib comctl32.lib dbghelp.lib 2>&1' -f $VcVarsPath,$Architecture,$output,$test,$extra
+        & $env:COMSPEC /d /s /c $compile
+        if ($LASTEXITCODE) { throw 'SSH integration test compilation failed' }
+    }
+    if ($BuildOnly) { return }
+    foreach ($mode in @('--terminal','--unicode-init')) {
+        & "$output/ssh_transfer_test.exe" $mode
+        if ($LASTEXITCODE) { throw "Client boundary test failed: $mode" }
+    }
     $arguments = @('tests/ssh_transfer_test.py', "$output/ssh_transfer_test.exe", '--shell', $ShellPath)
     if ($PhpPath) { $arguments += @('--php', $PhpPath) }
     & $PythonPath @arguments
     if ($LASTEXITCODE) { throw 'SSH integration tests failed' }
+    & $PythonPath tests/ssh_transfer_test.py "$output/shell_upload_bench.exe" --shell $ShellPath --command-delay-ms 20
+    if ($LASTEXITCODE) { throw 'Shell upload benchmark failed' }
 } finally {
     Pop-Location
 }

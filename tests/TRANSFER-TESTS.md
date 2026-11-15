@@ -33,3 +33,11 @@ The same runner executes `libssh2_boundary_test.c` against the production SFTP a
 transport parsers: valid and malformed NAME replies, STATUS request IDs, a short
 ETM packet, and malformed EXT_INFO. Guard pages turn out-of-bounds accesses into
 deterministic failures. Run both x64 and x86.
+
+Fresh-process checks also exercise ECMA-48 terminal filtering and `FsInitW`-only
+initialization, including password requests through Unicode callbacks. The shell
+tests cover multiline base64 uploads resumed across block boundaries.
+`shell_upload_bench.cpp` transfers a deterministic 96 KiB + 7 byte file, compares
+all received bytes, and reports elapsed time. Its loopback peer adds 20 ms per
+shell command and reports the command count, allowing before/after comparisons
+without real servers or saved profiles.
