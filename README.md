@@ -1104,5 +1104,7 @@ To add a new language: create `language\XYZ.lng` (UTF-8) following the existing 
 
 ## Download
 
-[![GitHub Latest](https://img.shields.io/github/v/release/numbereleven-a/sftp)](https://github.com/numbereleven-a/sftp/releases/latest)
-[![GitHub Downloads](https://img.shields.io/github/downloads/numbereleven-a/sftp/total)](https://github.com/numbereleven-a/sftp/releases)
+Repository: <https://github.com/numbereleven-a/totalcommander-sftp>
+
+[![GitHub Latest](https://img.shields.io/github/v/release/numbereleven-a/totalcommander-sftp)](https://github.com/numbereleven-a/totalcommander-sftp/releases/latest)
+[![GitHub Downloads](https://img.shields.io/github/downloads/numbereleven-a/totalcommander-sftp/total)](https://github.com/numbereleven-a/totalcommander-sftp/releases)
