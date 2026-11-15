@@ -1253,10 +1253,15 @@ static bool ImportKittySessionToIni(const KittySessionDescriptor& session,
         if (!ReadKittyString(session.filePath, "TerminalType", termtype) || termtype.empty())
             termtype = "xterm";
         std::string plainPassword;
+        struct PlainPasswordZeroGuard {
+            std::string& s;
+            ~PlainPasswordZeroGuard() { if (!s.empty()) SecureZeroMemory(s.data(), s.size()); }
+        } plainGuard{plainPassword};
         if (DecryptKittyPassword(encryptedPassword, host, termtype, plainPassword) && !plainPassword.empty()) {
             std::array<char, 1024> encBuf{};
             EncryptString(plainPassword.c_str(), encBuf.data(), static_cast<UINT>(encBuf.size()));
             WritePrivateProfileStringA(sectionName.c_str(), "password", encBuf.data(), iniFileName);
+            SecureZeroMemory(encBuf.data(), encBuf.size());
         }
     }
 

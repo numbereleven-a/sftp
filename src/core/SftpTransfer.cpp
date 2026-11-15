@@ -366,7 +366,7 @@ int SftpDownloadFileW(pConnectSettings cs, LPCWSTR RemoteName, LPCWSTR LocalName
             return SFTP_READFAILED;
 
         if (Resume && loaded > 0) {
-            sftpHandle->seek(static_cast<size_t>(loaded));
+            sftpHandle->seek(static_cast<uint64_t>(loaded));
             if (static_cast<int64_t>(sftpHandle->tell()) != loaded)
                 return SFTP_READFAILED;
         }
@@ -542,7 +542,7 @@ int SftpUploadFileW(pConnectSettings cs, LPCWSTR LocalName, LPCWSTR RemoteName,
             if (attr.filesize > 0) {
                  int64_t remoteSize = static_cast<int64_t>(attr.filesize);
                 if (remoteSize <= filesize) {
-                    remoteSftp->get()->seek(static_cast<size_t>(remoteSize));
+                    remoteSftp->get()->seek(static_cast<uint64_t>(remoteSize));
                     if (!local.Seek(remoteSize))
                         return SFTP_READFAILED;
                     resumeOffset = remoteSize;

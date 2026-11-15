@@ -51,6 +51,24 @@ SERVERID GetServerIdFromName(LPCSTR name, DWORD threadId) noexcept
     return entry ? entry->serverid : nullptr;
 }
 
+bool TryGetServerConnectInfo(LPCSTR name, DWORD threadId, std::string* outPassword, bool* outIsPhpTar) noexcept
+{
+    if (!name || !name[0])
+        return false;
+
+    std::lock_guard<std::mutex> lock(g_registryMutex);
+    bool is_bg = (threadId != mainthreadid && threadId != 0);
+    SERVERENTRY* entry = FindEntry(threadId, name, is_bg);
+    auto* cs = entry ? static_cast<pConnectSettings>(entry->serverid) : nullptr;
+    if (!cs)
+        return false;
+    if (outPassword)
+        *outPassword = cs->password;
+    if (outIsPhpTar)
+        *outIsPhpTar = IsPhpAgentTransport(cs) && cs->php_tar;
+    return true;
+}
+
 bool SetServerIdForName(LPCSTR name, SERVERID id) noexcept
 {
     if (!name || !name[0])
@@ -192,8 +210,14 @@ int CopyMoveServerInIniW(LPCSTR oldservername, LPCSTR newservername,
     AnsiToWide(oldservername, woldsect.data(), static_cast<int>(woldsect.size()));
     AnsiToWide(newservername, wnewsect.data(), static_cast<int>(wnewsect.size()));
 
-    std::array<wchar_t, 1024> captlist{};
-    GetPrivateProfileStringW(woldsect.data(), nullptr, L"", captlist.data(), static_cast<DWORD>(captlist.size() - 1), inifilename);
+    std::vector<wchar_t> captlist(4096, L'\0');
+    for (;;) {
+        const DWORD cap = static_cast<DWORD>(captlist.size());
+        const DWORD copied = GetPrivateProfileStringW(woldsect.data(), nullptr, L"", captlist.data(), cap, inifilename);
+        if (copied < cap - 2 || captlist.size() >= (1u << 20))
+            break;
+        captlist.assign(captlist.size() * 2, L'\0');
+    }
     if (captlist[0]) {
         if (!OverWrite) {
             std::array<wchar_t, 100> testlist{};
@@ -205,13 +229,21 @@ int CopyMoveServerInIniW(LPCSTR oldservername, LPCSTR newservername,
         DeleteServerFromIniW(newservername, inifilename);
 
         wchar_t* pcapt = captlist.data();
+        bool allWritten = true;
+        std::vector<wchar_t> valuebuf(2048, L'\0');
         while (pcapt[0]) {
-            std::array<wchar_t, 1024> valuebuf{};
-            GetPrivateProfileStringW(woldsect.data(), pcapt, L"", valuebuf.data(), static_cast<DWORD>(valuebuf.size() - 1), inifilename);
-            WritePrivateProfileStringW(wnewsect.data(), pcapt, valuebuf.data(), inifilename);
+            for (;;) {
+                const DWORD vcap = static_cast<DWORD>(valuebuf.size());
+                const DWORD vcopied = GetPrivateProfileStringW(woldsect.data(), pcapt, L"", valuebuf.data(), vcap, inifilename);
+                if (vcopied < vcap - 1 || valuebuf.size() >= 65536)
+                    break;
+                valuebuf.assign(valuebuf.size() * 2, L'\0');
+            }
+            if (!WritePrivateProfileStringW(wnewsect.data(), pcapt, valuebuf.data(), inifilename))
+                allWritten = false;
             pcapt += wcslen(pcapt) + 1;
         }
-        if (Move)
+        if (Move && allWritten)
             DeleteServerFromIniW(oldservername, inifilename);
         return FS_FILE_OK;
     }

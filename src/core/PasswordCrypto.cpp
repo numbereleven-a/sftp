@@ -120,7 +120,9 @@ std::optional<std::string> LegacyDecryptXor(std::string_view encrypted)
     result.reserve(encrypted.size() / 3);
 
     for (size_t i = 0; i < encrypted.size(); i += 3) {
-        if (!isdigit(encrypted[i]) || !isdigit(encrypted[i+1]) || !isdigit(encrypted[i+2]))
+        if (!isdigit(static_cast<unsigned char>(encrypted[i])) ||
+            !isdigit(static_cast<unsigned char>(encrypted[i+1])) ||
+            !isdigit(static_cast<unsigned char>(encrypted[i+2])))
             return std::nullopt;
 
         int num = (encrypted[i] - '0') * 100 +

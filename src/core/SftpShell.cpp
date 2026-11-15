@@ -82,12 +82,6 @@ bool IsEchoOrPromptLine(std::string_view line) noexcept
     return false;
 }
 
-// Decode octal escape sequences in-place (modifies string)
-void StripEscapeSequences(std::string& str)
-{
-    str = terminal_text::DecodeOctalEscapes(terminal_text::StripControls(str));
-}
-
 void StripEscapeSequencesLocalA(LPSTR msgbuf)
 {
     if (!msgbuf || !msgbuf[0])
@@ -98,6 +92,11 @@ void StripEscapeSequencesLocalA(LPSTR msgbuf)
 }
 
 } // anonymous namespace
+
+void StripEscapeSequences(std::string& str)
+{
+    str = terminal_text::DecodeOctalEscapes(terminal_text::StripControls(str));
+}
 
 void StripEscapeSequences(LPSTR msgbuf)
 {
@@ -314,16 +313,16 @@ bool ScpReadCommandOutput(pConnectSettings cs, const char* endMarker,
     const std::string beginMarkerStr(beginMarker ? beginMarker : "");
     const bool hasBegin = !beginMarkerStr.empty();
 
-    std::array<char, 4096> line{};
+    std::string lineStr;
     const auto start = std::chrono::steady_clock::now();
     bool gotBegin = !hasBegin;
     bool gotEnd = false;
 
     while (ReadChannelLine(cs->scpShellChannel.get(),
-                           line.data(), line.size() - 1,
-                           cs->scpShellMsgBuf, cs->scpShellErrBuf))
+                           lineStr,
+                           cs->scpShellMsgBuf, cs->scpShellErrBuf,
+                           cs->sock))
     {
-        std::string lineStr(line.data());
         StripEscapeSequences(lineStr);
         std::string_view trimmed = TrimLeft(lineStr);
 
@@ -356,10 +355,11 @@ bool ScpReadCommandOutput(pConnectSettings cs, const char* endMarker,
     return gotEnd && gotBegin;
 }
 
-bool ReadChannelLine(ISshChannel* channel, char* line, size_t lineLen,
+bool ReadChannelLine(ISshChannel* channel, std::string& outLine,
                      std::string& msgbuf, std::string& errbuf, SOCKET sock,
                      DWORD idleTimeoutMs, DWORD totalTimeoutMs)
 {
+    outLine.clear();
     const auto start = std::chrono::steady_clock::now();
     auto lastData = start;
     bool endReceived = false;
@@ -405,10 +405,8 @@ bool ReadChannelLine(ISshChannel* channel, char* line, size_t lineLen,
             } else if (detectingCrLf && global_detectcrlf == -1) {
                 global_detectcrlf = 0;
             }
-            const size_t copyLen = (std::min)(lineEnd, lineLen - 1);
-            msgbuf.copy(line, copyLen, 0);
-            line[copyLen] = '\0';
-            StripEscapeSequences(line);
+            outLine.assign(msgbuf.data(), lineEnd);
+            StripEscapeSequences(outLine);
             msgbuf.erase(0, pos + 1);
             return true;
         }
@@ -424,16 +422,30 @@ bool ReadChannelLine(ISshChannel* channel, char* line, size_t lineLen,
         if (endReceived && rc <= 0 && rc != LIBSSH2_ERROR_EAGAIN) {
             if (!msgbuf.empty() && msgbuf[0] != '\r' && msgbuf[0] != '\n') {
                 // Flush the remaining partial line (no trailing newline from the server).
-                const size_t copyLen = (std::min)(msgbuf.size(), lineLen - 1);
-                msgbuf.copy(line, copyLen, 0);
-                line[copyLen] = '\0';
-                StripEscapeSequences(line);
+                outLine = msgbuf;
+                StripEscapeSequences(outLine);
                 msgbuf.clear();
                 return true;
             }
             return false;
         }
     }
+}
+
+bool ReadChannelLine(ISshChannel* channel, char* line, size_t lineLen,
+                     std::string& msgbuf, std::string& errbuf, SOCKET sock,
+                     DWORD idleTimeoutMs, DWORD totalTimeoutMs)
+{
+    if (!line || lineLen == 0)
+        return false;
+    std::string fullLine;
+    if (!ReadChannelLine(channel, fullLine, msgbuf, errbuf, sock, idleTimeoutMs, totalTimeoutMs))
+        return false;
+    const size_t copyLen = (std::min)(fullLine.size(), lineLen - 1);
+    if (copyLen > 0)
+        memcpy(line, fullLine.data(), copyLen);
+    line[copyLen] = '\0';
+    return true;
 }
 
 int SftpQuoteCommand2(pConnectSettings cs, const char* remotedir, const char* cmd,

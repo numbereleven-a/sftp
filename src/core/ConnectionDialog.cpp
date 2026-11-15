@@ -2931,10 +2931,12 @@ pConnectSettings SftpConnectToServer(LPCSTR DisplayName, LPCSTR inifilename, LPC
             std::array<char, 4096> passwordBuf{};
             int rc = CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_LOAD_PASSWORD, DisplayName, passwordBuf.data(), static_cast<int>(passwordBuf.size() - 1));
             if (rc != FS_FILE_OK) {
+                SecureZeroMemory(passwordBuf.data(), passwordBuf.size());
                 ConnectSettings.feedback->ShowError(LngStrU8(IDS_ERR_LOAD_PASS, "Failed to load password!"));
                 return nullptr;
             }
             ConnectSettings.password = passwordBuf.data();
+            SecureZeroMemory(passwordBuf.data(), passwordBuf.size());
         }
         if (CryptProc && ConnectSettings.proxypassword == "\001") {
             std::array<char, 64> proxyentry{};
@@ -2947,10 +2949,12 @@ pConnectSettings SftpConnectToServer(LPCSTR DisplayName, LPCSTR inifilename, LPC
             std::array<char, 4096> proxyPasswordBuf{};
             int rc = CryptProc(PluginNumber, CryptoNumber, FS_CRYPT_LOAD_PASSWORD, proxyentry.data(), proxyPasswordBuf.data(), static_cast<int>(proxyPasswordBuf.size() - 1));
             if (rc != FS_FILE_OK) {
+                SecureZeroMemory(proxyPasswordBuf.data(), proxyPasswordBuf.size());
                 ConnectSettings.feedback->ShowError(LngStrU8(IDS_ERR_LOAD_PROXY_PASS, "Failed to load proxy password!"));
                 return nullptr;
             }
             ConnectSettings.proxypassword = proxyPasswordBuf.data();
+            SecureZeroMemory(proxyPasswordBuf.data(), proxyPasswordBuf.size());
         }
         // Clear proxy credentials when proxy type is disabled.
         if (ConnectSettings.proxytype == sftp::Proxy::notused) {

@@ -114,6 +114,60 @@ int main() {
             lanpair_internal::closeSocket(altered);
         }
     }
+    // Preserve existing destination across insufficient-space and interrupted overwrites.
+    auto b64 = [](const std::string& in) {
+        static constexpr char kTbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        int val = 0, valb = -6;
+        for (unsigned char c : in) {
+            val = (val << 8) + c;
+            valb += 8;
+            while (valb >= 0) { out.push_back(kTbl[(val >> valb) & 0x3F]); valb -= 6; }
+        }
+        if (valb > -6) out.push_back(kTbl[((val << 8) >> (valb + 8)) & 0x3F]);
+        while (out.size() % 4) out.push_back('=');
+        return out;
+    };
+    const auto preservedFile = root / "preserve.txt";
+    { std::ofstream file(preservedFile, std::ios::binary); file << "ORIGINAL-DATA"; }
+    auto readAll = [](const std::filesystem::path& p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(f), {});
+    };
+    {
+        SOCKET spaceSock = connectAuthenticated();
+        check(spaceSock != INVALID_SOCKET, "space-check test authenticated");
+        if (spaceSock != INVALID_SOCKET) {
+            lanpair_internal::sendLine(spaceSock, "LAN3 HELLO");
+            std::string line;
+            lanpair_internal::recvLine(spaceSock, &line);
+            const std::string remoteTarget = share + "/preserve.txt";
+            lanpair_internal::sendLine(
+                spaceSock,
+                "PUT2 " + b64(remoteTarget) + " 1152921504606846976 1");
+            check(lanpair_internal::recvLine(spaceSock, &line) && line == "ERR insufficient-space",
+                  "insufficient space rejected before truncating target");
+            check(readAll(preservedFile) == "ORIGINAL-DATA", "insufficient space leaves existing file intact");
+            lanpair_internal::closeSocket(spaceSock);
+        }
+    }
+    {
+        SOCKET partialSock = connectAuthenticated();
+        check(partialSock != INVALID_SOCKET, "partial-overwrite test authenticated");
+        if (partialSock != INVALID_SOCKET) {
+            lanpair_internal::sendLine(partialSock, "LAN3 HELLO");
+            std::string line;
+            lanpair_internal::recvLine(partialSock, &line);
+            const std::string remoteTarget = share + "/preserve.txt";
+            lanpair_internal::sendLine(
+                partialSock,
+                "PUT2 " + b64(remoteTarget) + " 1024 1");
+            check(lanpair_internal::recvLine(partialSock, &line) && line == "OK",
+                  "staged overwrite accepted header before stream");
+            lanpair_internal::sendAll(partialSock, reinterpret_cast<const uint8_t*>("PARTIAL"), 7);
+            lanpair_internal::closeSocket(partialSock);
+        }
+    }
     // Interrupt an authenticated idle client, then a pre-authentication client.
     SOCKET idle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(45986);
@@ -123,6 +177,13 @@ int main() {
     const auto start = std::chrono::steady_clock::now();
     server.stop();
     check(std::chrono::steady_clock::now() - start < std::chrono::seconds(1), "idle clients interrupted during shutdown");
+    check(readAll(preservedFile) == "ORIGINAL-DATA", "interrupted overwrite preserves original file");
+    bool hasTempLeftover = false;
+    for (const auto& entry : std::filesystem::directory_iterator(root)) {
+        if (entry.path().filename().wstring().find(L".lan3tmp.") != std::wstring::npos)
+            hasTempLeftover = true;
+    }
+    check(!hasTempLeftover, "interrupted overwrite cleans up staging temp file");
     closesocket(idle);
     session.reset();
     return failures ? 1 : 0;

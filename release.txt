@@ -1,16 +1,29 @@
 # Release Notes
 
-## SFTPplug 10.2.5.3
+## SFTPplug 10.3.0.0
 
 ### Fixes
 
-- Fixed terminal control-sequence filtering in shell mode. Bracketed-paste switches, OSC records, and other escape sequences no longer discard valid output. UTF-8 filenames are preserved.
+- Fixed terminal control-sequence filtering in shell mode: removed the 8 KiB line limit, preserved UTF-8 filenames, and ensured bracketed-paste switches, OSC records, and other escape sequences no longer discard valid output.
 - Fixed a crash when the host initializes the plugin through `FsInitW` only. ANSI callback adapters now forward password requests, progress updates, and log messages to the Unicode callbacks.
+- Fixed a packet double-free condition in `libssh2` ETM decrypt and boundary error handling (`_libssh2_transport_read` / `fullpacket`), and rebuilt both static `libssh2` (`x64` / `x86`) mbedTLS libraries.
+- Fixed binary SOCKS5 `CONNECT` encoding for numeric IPv6 targets (`ATYP=4`), port selection, and unsigned `ATYP=3` domain length decoding (`>= 128`). Fixed `ProxyJump` authentication state ownership, secret cleanup, and socket teardown.
+- Fixed >1024-character section truncation in `CopyMoveServerInIniW`, added read-only server lookup for `FsStatusInfo`, hardened `DLL_PROCESS_DETACH` and `FsSetDefaultParams` null guards, and fixed modal flags on the exception error dialog.
+- Made the SSH keepalive timer window and per-connection state thread-safe, and stripped surrounding quotes on secondary keyboard-interactive password prompts.
+- Upgraded SFTP file offsets (`seek`/`tell`) to 64-bit for transfers larger than 4 GiB. Reset the SCP download inactivity timer on transfer progress, fixed shell output socket lookup, and fixed `dd`/base64 downloads when the remote size hint is unknown (`-1`).
+- Replaced polling peer discovery in `LanPairConnect` with condition-variable waits, properly aborted mid-stream read errors on `GET`, and added pre-flight free-space checks plus staged atomic overwrite (`MoveFileExW`) on `PUT` so failed transfers preserve existing destination files.
+- Fixed multi-subdirectory PHP TAR batch uploads and `GET_MULTI_THREAD` batch downloads by scoping TAR sessions per thread, computing the common remote directory prefix, adopting active sessions in `FsGetFileW`, and allowing root (`path=.`) extraction in `op_tar_extract`.
+- Removed redundant TAR preflight from single-file `op_get`, normalized TAR pack/extract relative paths strictly (preserving dotted filenames), applied configured salts in HMAC key derivation, and throttled stale nonce directory cleanup.
+- Fixed local timezone conversion in `UnixTimeToLocalTime` via `FileTimeToLocalFileTime`, fixed signed `char` handling in `LegacyDecryptXor`, eliminated close-reopen races when writing converted PPK PEM keys, and scrubbed temporary key/password buffers with `SecureZeroMemory`.
 
 ### Improvements
 
 - Accelerated shell uploads with multiline base64 blocks of up to 48 KiB on compatible shells. Other shells retain the existing 1 KiB transfer path.
 - Preserved exact resume offsets across upload block boundaries.
+
+### Compatibility
+
+- Deploy the updated `sftp.php` alongside the plugin so root TAR extraction (`path=.`) and salted HMAC authentication work together.
 
 ## SFTPplug 10.2.5.2
 

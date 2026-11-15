@@ -244,6 +244,8 @@ fullpacket(LIBSSH2_SESSION * session, int encrypted /* 1 or 0 */ )
 
                 if(p->total_num < mac_len + 4 + (size_t)blocksize) {
                     LIBSSH2_FREE(session, p->payload);
+                    p->payload = NULL;
+                    p->total_num = 0;
                     return LIBSSH2_ERROR_DECRYPT;
                 }
                 decrypt_size = (ssize_t)(p->total_num - mac_len - 4);
@@ -699,8 +701,11 @@ int _libssh2_transport_read(LIBSSH2_SESSION * session)
                         }
                     }
                     else {
-                        if(p->payload)
+                        if(p->payload) {
                             LIBSSH2_FREE(session, p->payload);
+                            p->payload = NULL;
+                        }
+                        p->total_num = 0;
                         return LIBSSH2_ERROR_OUT_OF_BOUNDARY;
                     }
                 }

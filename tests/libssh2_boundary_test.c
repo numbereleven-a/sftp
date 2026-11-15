@@ -21,10 +21,15 @@ static void *guard_alloc(size_t size, void **abstract)
     VirtualProtect(base + pages, 4096, PAGE_NOACCESS, &old);
     return base + pages - aligned;
 }
+static int double_free_count = 0;
+static void *last_freed_ptr = NULL;
 static void guard_free(void *ptr, void **abstract)
 {
     MEMORY_BASIC_INFORMATION info;
     (void)abstract;
+    if(ptr && ptr == last_freed_ptr)
+        ++double_free_count;
+    last_freed_ptr = ptr;
     if(ptr && VirtualQuery(ptr, &info, sizeof(info))) VirtualFree(info.AllocationBase, 0, MEM_RELEASE);
 }
 static void *guard_realloc(void *ptr, size_t size, void **abstract)
@@ -114,11 +119,16 @@ static int short_etm(void)
     session->packet.total_num = 9;
     session->packet.payload = guard_alloc(9, NULL);
     memset(session->packet.payload, 0, 9);
+    double_free_count = 0;
+    last_freed_ptr = NULL;
     rc = fullpacket(session, 1);
-    session->packet.payload = NULL;
     session->remote.mac = NULL;
     session->remote.crypt = NULL;
     libssh2_session_free(session);
+    if(double_free_count != 0) {
+        fprintf(stderr, "FAIL short-etm: double_free_count=%d\n", double_free_count);
+        return 1;
+    }
     printf("%s short-etm\n", rc == LIBSSH2_ERROR_DECRYPT ? "PASS" : "FAIL");
     return rc == LIBSSH2_ERROR_DECRYPT ? 0 : 1;
 }

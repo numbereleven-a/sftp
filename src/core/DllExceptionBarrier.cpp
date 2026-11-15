@@ -269,11 +269,12 @@ void DllExceptionBarrier::show_error_ui() noexcept
 
         msg += L"\n\nIf this repeats, please report it together with the log.";
 
+        const HWND owner = ::GetActiveWindow();
         ::MessageBoxW(
-            ::GetActiveWindow(),
+            owner,
             msg.c_str(),
             L"SFTP Plugin \u2014 Unhandled Exception",
-            MB_OK | MB_ICONERROR | MB_TASKMODAL);
+            MB_OK | MB_ICONERROR | (owner ? MB_APPLMODAL : MB_SETFOREGROUND));
     }
     catch (...) {
         ::OutputDebugStringA("[SFTP] DllExceptionBarrier::show_error_ui "

@@ -275,7 +275,7 @@ int SftpFindFirstFileW(pConnectSettings cs, LPCWSTR remotedir, LPVOID* davdatapt
                 }
             }
 
-			if (!gotEnd && entries.empty()) {
+            if (!gotEnd) {
                 if (!cs->scpShellErrBuf.empty()) {
                     std::string err = cs->scpShellErrBuf;
                     StripEscapeSequences(err.data());
@@ -285,11 +285,9 @@ int SftpFindFirstFileW(pConnectSettings cs, LPCWSTR remotedir, LPVOID* davdatapt
                 }
                 CloseScpShell(cs);
 
-                // Instead of immediately throwing an error, try reconnecting channel.
+                // CloseScpShell closes only the shell channel while preserving the TCP socket;
+                // retrying opens a fresh shell channel on the next EnsureScpShell attempt.
                 if (attempt == 0) {
-                    // FIX CLAUDE: Nie niszczymy gniazda TCP! Wystarczy, że CloseScpShell 
-                    // zamknęło kanał. W kolejnym cyklu EnsureScpShell otworzy nowy.
-                    // cs->sock = INVALID_SOCKET; <-- USUNIĘTE
                     continue;
                 }
                 return SFTP_FAILED;
@@ -512,7 +510,7 @@ int SftpCreateDirectoryW(pConnectSettings cs, LPCWSTR Path)
         rc = cs->sftpsession->mkdir(dirStr.c_str(), cs->dirmod);
         if (rc == 0)
             break;
-        int delta = get_ticks_between(cs->findstarttime);
+        int delta = get_ticks_between(start);
         if (delta > kSftpProgressStartMs && aborttime == -1) {
             if (EscapePressed())
                 aborttime = get_sys_ticks() + kSftpAbortGraceMs;

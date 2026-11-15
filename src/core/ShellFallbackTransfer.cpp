@@ -169,13 +169,13 @@ static bool ShellExecPersistentProcessLines(
     const SYSTICKS start = get_sys_ticks();
     bool gotBeginMarker = false;
     bool gotEndMarker = false;
-    std::array<char, 8192> line{};
+    std::string line;
 
-    while (ReadChannelLine(cs->scpShellChannel.get(), line.data(), line.size() - 1,
+    while (ReadChannelLine(cs->scpShellChannel.get(), line,
                            cs->scpShellMsgBuf, cs->scpShellErrBuf, cs->sock))
     {
-        StripEscapeSequences(line.data());
-        const char* p = ShellTrimLeft(line.data());
+        StripEscapeSequences(line);
+        const char* p = ShellTrimLeft(line.c_str());
         if (!p[0])
             continue;
 
@@ -422,6 +422,9 @@ static int ShellDdDownloadBase64(
             if (lineLen == 0)
                 return true;
 
+            const size_t maxDecoded = (lineLen * 3) / 4 + 16;
+            if (decodeBuf.size() < maxDecoded)
+                decodeBuf.resize(maxDecoded);
             size_t decoded = ShellB64Decode(std::string_view(p, lineLen), std::span<uint8_t>(decodeBuf.data(), decodeBuf.size()));
             if (decoded == 0)
                 return true;
@@ -458,8 +461,9 @@ static int ShellDdDownloadBase64(
     SHELL_DD_LOG("b64 DL end: lines=%d decodedTotal=%lld out=%lld",
                  lineCount, (long long)decodedTotal, (long long)*outSizeLoaded);
 
-    if (*outSizeLoaded != hintedSize) {
-        SHELL_DD_LOG("b64 DL failed: no lines returned for non-empty file");
+    if (hintedSize >= 0 && *outSizeLoaded != hintedSize) {
+        SHELL_DD_LOG("b64 DL failed: size mismatch out=%lld hinted=%lld",
+                     (long long)*outSizeLoaded, (long long)hintedSize);
         return SFTP_READFAILED;
     }
 

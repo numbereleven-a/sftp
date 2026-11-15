@@ -1352,66 +1352,58 @@ struct TarUploadSession {
     bool                      active = false;
 };
 
-static TarUploadSession s_tarSession;
-// Serialises all TAR batch-session state (upload + download). TC may drive
+static std::unordered_map<DWORD, TarUploadSession> s_tarSessions;
+// Serialises all TAR batch-session maps (upload + download). TC may drive
 // PUT/GET_MULTI from background transfer threads while the main thread
-// touches the same globals.
+// touches its own session concurrently.
 static std::mutex s_tarSessionsMu;
 
 void TarUploadSessionBegin(pConnectSettings cs)
 {
     std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-    s_tarSession.cs = cs;
-    s_tarSession.remoteBaseRel.clear();
-    s_tarSession.entries.clear();
-    s_tarSession.active = true;
+    auto& sess = s_tarSessions[GetCurrentThreadId()];
+    if (sess.active && sess.cs == nullptr && cs != nullptr) {
+        sess.cs = cs;
+        return;
+    }
+    sess.cs = cs;
+    sess.remoteBaseRel.clear();
+    sess.entries.clear();
+    sess.active = true;
 }
 
 void TarUploadSessionClear()
 {
     std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-    s_tarSession.active = false;
-    s_tarSession.cs = nullptr;
-    s_tarSession.remoteBaseRel.clear();
-    s_tarSession.entries.clear();
+    s_tarSessions.erase(GetCurrentThreadId());
 }
 
 bool TarUploadSessionIsActive(pConnectSettings cs)
 {
     std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-    return s_tarSession.active && (cs == nullptr || s_tarSession.cs == cs);
+    const auto it = s_tarSessions.find(GetCurrentThreadId());
+    if (it == s_tarSessions.end()) return false;
+    return it->second.active && (cs == nullptr || it->second.cs == cs);
 }
 
 bool TarUploadSessionQueue(pConnectSettings cs, LPCWSTR localPath, const char* remotePath)
 {
     std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-    if (!s_tarSession.active || s_tarSession.cs != cs || !localPath || !remotePath)
+    const auto it = s_tarSessions.find(GetCurrentThreadId());
+    if (it == s_tarSessions.end()) return false;
+    auto& sess = it->second;
+    if (!sess.active || !cs || !localPath || !remotePath)
+        return false;
+    if (sess.cs == nullptr)
+        sess.cs = cs;
+    else if (sess.cs != cs)
         return false;
 
     std::string remoteA = remotePath;
     for (char& c : remoteA) if (c == '\\') c = '/';
-
-    // Compute remoteBase from first queued entry
-    if (s_tarSession.remoteBaseRel.empty() && s_tarSession.entries.empty()) {
-        size_t slash = remoteA.rfind('/');
-        if (slash != std::string::npos)
-            s_tarSession.remoteBaseRel = unicode_util::utf8_to_wstring(remoteA.substr(0, slash));
-        else
-            s_tarSession.remoteBaseRel = L".";
-    }
-
-    // Compute TAR name: strip remoteBase prefix
-    std::string baseA = unicode_util::wide_to_narrow(s_tarSession.remoteBaseRel.c_str());
-    std::string tarName;
-    if (!baseA.empty() && remoteA.size() > baseA.size() + 1
-        && _strnicmp(remoteA.c_str(), baseA.c_str(), baseA.size()) == 0
-        && remoteA[baseA.size()] == '/')
-    {
-        tarName = remoteA.substr(baseA.size() + 1);
-    } else {
-        tarName = remoteA;
-    }
-    if (tarName.empty()) return false;
+    while (!remoteA.empty() && remoteA.front() == '/')
+        remoteA.erase(remoteA.begin());
+    if (remoteA.empty()) return false;
 
     WIN32_FILE_ATTRIBUTE_DATA fad{};
     if (!GetFileAttributesExW(localPath, GetFileExInfoStandard, &fad))
@@ -1419,7 +1411,7 @@ bool TarUploadSessionQueue(pConnectSettings cs, LPCWSTR localPath, const char* r
 
     TarUploadEntry e;
     e.localPath = localPath;
-    e.tarName   = tarName;
+    e.tarName   = std::move(remoteA);
     e.isDir     = !!(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
     if (!e.isDir) {
         LARGE_INTEGER sz;
@@ -1431,30 +1423,58 @@ bool TarUploadSessionQueue(pConnectSettings cs, LPCWSTR localPath, const char* r
     ull.LowPart  = fad.ftLastWriteTime.dwLowDateTime;
     ull.HighPart = fad.ftLastWriteTime.dwHighDateTime;
     e.mtime = (time_t)((ull.QuadPart - 116444736000000000ULL) / 10000000ULL);
-    s_tarSession.entries.push_back(std::move(e));
+    sess.entries.push_back(std::move(e));
     return true;
 }
 
 int TarUploadSessionExecuteAndClear()
 {
     pConnectSettings cs = nullptr;
-    std::wstring remoteBase;
     std::vector<TarUploadEntry> entries;
     {
         std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-        if (!s_tarSession.active) return SFTP_OK;
-        cs          = s_tarSession.cs;
-        remoteBase  = s_tarSession.remoteBaseRel;
-        entries     = std::move(s_tarSession.entries);
-        s_tarSession.active = false;
-        s_tarSession.cs     = nullptr;
-        s_tarSession.remoteBaseRel.clear();
+        const auto it = s_tarSessions.find(GetCurrentThreadId());
+        if (it == s_tarSessions.end() || !it->second.active) return SFTP_OK;
+        cs      = it->second.cs;
+        entries = std::move(it->second.entries);
+        s_tarSessions.erase(it);
     }
-    if (entries.empty()) return SFTP_OK;
-    // Network I/O runs WITHOUT the lock so a concurrent Begin() is not blocked
-    // for the whole transfer duration.
-    const int rc = PhpAgentUploadDirAsTar(cs, remoteBase.c_str(), entries);
-    return rc;
+    if (!cs || entries.empty()) return SFTP_OK;
+
+    // Compute longest common directory prefix across all queued entries so
+    // files spanning multiple subdirectories land at their intended paths.
+    auto dirOf = [](const std::string& p) -> std::string {
+        const size_t slash = p.rfind('/');
+        return (slash == std::string::npos) ? std::string() : p.substr(0, slash);
+    };
+    std::string commonDir = dirOf(entries[0].tarName);
+    for (size_t i = 1; i < entries.size() && !commonDir.empty(); ++i) {
+        const std::string d = dirOf(entries[i].tarName);
+        while (!commonDir.empty()) {
+            if (d.size() == commonDir.size() && d == commonDir)
+                break;
+            if (d.size() > commonDir.size() &&
+                d.compare(0, commonDir.size(), commonDir) == 0 &&
+                d[commonDir.size()] == '/')
+                break;
+            const size_t slash = commonDir.rfind('/');
+            commonDir = (slash == std::string::npos) ? std::string() : commonDir.substr(0, slash);
+        }
+    }
+
+    const std::wstring remoteBase = commonDir.empty()
+        ? std::wstring(L".")
+        : unicode_util::utf8_to_wstring(commonDir);
+    if (!commonDir.empty()) {
+        const size_t stripLen = commonDir.size() + 1;
+        for (auto& e : entries) {
+            if (e.tarName.size() > stripLen)
+                e.tarName.erase(0, stripLen);
+        }
+    }
+
+    // Network I/O runs WITHOUT the lock so concurrent transfers are not blocked.
+    return PhpAgentUploadDirAsTar(cs, remoteBase.c_str(), entries);
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,46 +1482,58 @@ int TarUploadSessionExecuteAndClear()
 // ---------------------------------------------------------------------------
 
 struct TarDownloadSession {
-    pConnectSettings             cs     = nullptr;
+    pConnectSettings              cs = nullptr;
     std::vector<TarDownloadEntry> entries;
-    bool                         active = false;
+    bool                          active = false;
 };
 
-static TarDownloadSession s_tarDlSession;
+static std::unordered_map<DWORD, TarDownloadSession> s_tarDlSessions;
 
 void TarDownloadSessionBegin(pConnectSettings cs)
 {
     std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-    s_tarDlSession.cs = cs;
-    s_tarDlSession.entries.clear();
-    s_tarDlSession.active = true;
+    auto& sess = s_tarDlSessions[GetCurrentThreadId()];
+    if (sess.active && sess.cs == nullptr && cs != nullptr) {
+        sess.cs = cs;
+        return;
+    }
+    sess.cs = cs;
+    sess.entries.clear();
+    sess.active = true;
 }
 
 void TarDownloadSessionClear()
 {
     std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-    s_tarDlSession.active = false;
-    s_tarDlSession.cs = nullptr;
-    s_tarDlSession.entries.clear();
+    s_tarDlSessions.erase(GetCurrentThreadId());
 }
 
 bool TarDownloadSessionIsActive(pConnectSettings cs)
 {
     std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-    return s_tarDlSession.active && (cs == nullptr || s_tarDlSession.cs == cs);
+    const auto it = s_tarDlSessions.find(GetCurrentThreadId());
+    if (it == s_tarDlSessions.end()) return false;
+    return it->second.active && (cs == nullptr || it->second.cs == cs);
 }
 
 bool TarDownloadSessionQueue(pConnectSettings cs, LPCWSTR localPath, LPCWSTR remotePath)
 {
     std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-    if (!s_tarDlSession.active || s_tarDlSession.cs != cs || !localPath || !remotePath)
+    const auto it = s_tarDlSessions.find(GetCurrentThreadId());
+    if (it == s_tarDlSessions.end()) return false;
+    auto& sess = it->second;
+    if (!sess.active || !cs || !localPath || !remotePath)
+        return false;
+    if (sess.cs == nullptr)
+        sess.cs = cs;
+    else if (sess.cs != cs)
         return false;
 
     TarDownloadEntry e;
     e.remotePath = NormalizePhpRemotePath(cs, remotePath);
     if (e.remotePath.empty() || e.remotePath == ".") return false;
     e.localPath = localPath;
-    s_tarDlSession.entries.push_back(std::move(e));
+    sess.entries.push_back(std::move(e));
     return true;
 }
 
@@ -1511,14 +1543,13 @@ int TarDownloadSessionExecuteAndClear()
     std::vector<TarDownloadEntry> entries;
     {
         std::lock_guard<std::mutex> lk(s_tarSessionsMu);
-        if (!s_tarDlSession.active) return SFTP_OK;
-        cs      = s_tarDlSession.cs;
-        entries = std::move(s_tarDlSession.entries);
-        s_tarDlSession.active   = false;
-        s_tarDlSession.cs       = nullptr;
-        s_tarDlSession.entries.clear();
+        const auto it = s_tarDlSessions.find(GetCurrentThreadId());
+        if (it == s_tarDlSessions.end() || !it->second.active) return SFTP_OK;
+        cs      = it->second.cs;
+        entries = std::move(it->second.entries);
+        s_tarDlSessions.erase(it);
     }
-    if (entries.empty()) return SFTP_OK;
+    if (!cs || entries.empty()) return SFTP_OK;
     // Network I/O runs WITHOUT the lock (see TarUploadSessionExecuteAndClear).
     return PhpAgentDownloadFilesAsTar(cs, entries);
 }

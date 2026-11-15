@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 typedef LPVOID  SERVERID;
 typedef LPVOID  SERVERHANDLE;
 
@@ -20,6 +22,7 @@ int  CopyMoveServerInIni(LPCSTR oldservername, LPCSTR newservername, bool Move, 
 
 // Server id lookup / registration
 SERVERID GetServerIdFromName(LPCSTR servername, DWORD threadid) noexcept;
+bool TryGetServerConnectInfo(LPCSTR servername, DWORD threadid, std::string* outPassword, bool* outIsPhpTar) noexcept;
 bool SetServerIdForName(LPCSTR displayname, SERVERID newid) noexcept;
 
 // Path helpers

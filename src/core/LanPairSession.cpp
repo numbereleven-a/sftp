@@ -720,13 +720,13 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
             } else if (cmd == "GET" && parts.size() >= 3) {
                 const int64_t offset = static_cast<int64_t>(
                     std::strtoll(parts[2].c_str(), nullptr, 10));
-                cmdGet(s, b64DecodeStr(parts[1]), offset);
+                if (!cmdGet(s, b64DecodeStr(parts[1]), offset)) break;
             } else if (cmd == "PUT" && parts.size() >= 3) {
                 const int64_t size = static_cast<int64_t>(
                     std::strtoll(parts[2].c_str(), nullptr, 10));
-                cmdPut(s, b64DecodeStr(parts[1]), size, false);
+                if (!cmdPut(s, b64DecodeStr(parts[1]), size, false)) break;
             } else if (cmd == "PUT2" && parts.size() == 4 && (parts[3] == "0" || parts[3] == "1")) {
-                cmdPut(s, b64DecodeStr(parts[1]), std::strtoll(parts[2].c_str(), nullptr, 10), parts[3] == "1");
+                if (!cmdPut(s, b64DecodeStr(parts[1]), std::strtoll(parts[2].c_str(), nullptr, 10), parts[3] == "1")) break;
             } else if (cmd == "MKDIR" && parts.size() >= 2) {
                 cmdMkdir(s, b64DecodeStr(parts[1]));
             } else if (cmd == "DEL" && parts.size() >= 2) {
@@ -828,65 +828,99 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
         for (const auto& l : lines) sendLine(s, l);
     }
 
-    void cmdGet(SOCKET s, const std::string& path, int64_t offset) {
-        if (offset < 0) { sendLine(s, "ERR bad-offset"); return; }
+    bool cmdGet(SOCKET s, const std::string& path, int64_t offset) {
+        if (offset < 0) { sendLine(s, "ERR bad-offset"); return true; }
         const std::wstring wpath = allowedPath(path);
-        if (wpath.empty()) { sendLine(s, "ERR path-not-allowed"); return; }
+        if (wpath.empty()) { sendLine(s, "ERR path-not-allowed"); return true; }
         HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-        if (h == INVALID_HANDLE_VALUE) { sendLine(s, "ERR not-found"); return; }
+        if (h == INVALID_HANDLE_VALUE) { sendLine(s, "ERR not-found"); return true; }
 
         LARGE_INTEGER sz{};
-        if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); sendLine(s, "ERR stat-failed"); return; }
+        if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); sendLine(s, "ERR stat-failed"); return true; }
 
         if (offset > 0) {
             LARGE_INTEGER li{}; li.QuadPart = offset;
             if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) {
-                CloseHandle(h); sendLine(s, "ERR seek-failed"); return;
+                CloseHandle(h); sendLine(s, "ERR seek-failed"); return true;
             }
         }
 
         const int64_t dataSize = sz.QuadPart - offset;
-        if (dataSize < 0) { CloseHandle(h); sendLine(s, "ERR bad-offset"); return; }
+        if (dataSize < 0) { CloseHandle(h); sendLine(s, "ERR bad-offset"); return true; }
 
         std::ostringstream resp;
         resp << "OK " << dataSize;
-        if (!sendLine(s, resp.str())) { CloseHandle(h); return; }
+        if (!sendLine(s, resp.str())) { CloseHandle(h); return false; }
 
         constexpr size_t kChunk = 65536;
         std::vector<uint8_t> buf(kChunk);
         int64_t remaining = dataSize;
+        bool streamFailed = false;
         while (remaining > 0) {
             const DWORD want = static_cast<DWORD>(
                 std::min<int64_t>(remaining, static_cast<int64_t>(kChunk)));
             DWORD bytesRead = 0;
-            if (!ReadFile(h, buf.data(), want, &bytesRead, nullptr) || bytesRead == 0) break;
-            if (!sendAll(s, buf.data(), bytesRead)) break;
+            if (!ReadFile(h, buf.data(), want, &bytesRead, nullptr) || bytesRead == 0) {
+                streamFailed = true;
+                break;
+            }
+            if (!sendAll(s, buf.data(), bytesRead)) {
+                streamFailed = true;
+                break;
+            }
             remaining -= static_cast<int64_t>(bytesRead);
         }
         CloseHandle(h);
+        if (streamFailed) {
+            shutdown(s, SD_BOTH);
+            return false;
+        }
+        return true;
     }
 
-    void cmdPut(SOCKET s, const std::string& path, int64_t size, bool overwrite) {
-        if (size < 0) { sendLine(s, "ERR bad-size"); return; }
+    bool cmdPut(SOCKET s, const std::string& path, int64_t size, bool overwrite) {
+        if (size < 0) { sendLine(s, "ERR bad-size"); return true; }
         const std::wstring wpath = allowedPath(path);
-        if (wpath.empty()) { sendLine(s, "ERR path-not-allowed"); return; }
-        HANDLE h = CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr,
-                               overwrite ? CREATE_ALWAYS : CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {
-            // Client sends data only AFTER receiving "OK", so nothing to drain here.
-            sendLine(s, GetLastError() == ERROR_FILE_EXISTS ? "EXISTS" : "ERR open-failed");
-            return;
-        }
+        if (wpath.empty()) { sendLine(s, "ERR path-not-allowed"); return true; }
 
-        ULARGE_INTEGER available{};
         const auto separator = wpath.find_last_of(L'\\');
+        ULARGE_INTEGER available{};
         if (separator == wpath.npos ||
             !GetDiskFreeSpaceExW(wpath.substr(0, separator + 1).c_str(), &available, nullptr, nullptr) ||
             static_cast<uint64_t>(size) > available.QuadPart) {
-            CloseHandle(h); sendLine(s, "ERR insufficient-space"); return;
+            sendLine(s, "ERR insufficient-space");
+            return true;
         }
-        sendLine(s, "OK");
+
+        const DWORD existingAttr = GetFileAttributesW(wpath.c_str());
+        if (existingAttr != INVALID_FILE_ATTRIBUTES) {
+            if (existingAttr & FILE_ATTRIBUTE_DIRECTORY) {
+                sendLine(s, "ERR open-failed");
+                return true;
+            }
+            if (!overwrite) {
+                sendLine(s, "EXISTS");
+                return true;
+            }
+        }
+
+        static std::atomic<uint64_t> tmpSeq{0};
+        const std::wstring tmpPath = wpath + L".lan3tmp." +
+            std::to_wstring(GetCurrentProcessId()) + L"." +
+            std::to_wstring(tmpSeq.fetch_add(1, std::memory_order_relaxed));
+
+        HANDLE h = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            sendLine(s, "ERR open-failed");
+            return true;
+        }
+        if (!sendLine(s, "OK")) {
+            CloseHandle(h);
+            DeleteFileW(tmpPath.c_str());
+            return false;
+        }
 
         constexpr size_t kChunk = 65536;
         std::vector<uint8_t> buf(kChunk);
@@ -904,7 +938,21 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
             remaining -= static_cast<int64_t>(want);
         }
         CloseHandle(h);
-        sendLine(s, ok ? "DONE" : "ERR write-failed");
+        if (!ok) {
+            DeleteFileW(tmpPath.c_str());
+            sendLine(s, "ERR write-failed");
+            return false;
+        }
+
+        if (!MoveFileExW(tmpPath.c_str(), wpath.c_str(), overwrite ? MOVEFILE_REPLACE_EXISTING : 0)) {
+            const DWORD moveErr = GetLastError();
+            DeleteFileW(tmpPath.c_str());
+            sendLine(s, (!overwrite && (moveErr == ERROR_FILE_EXISTS || moveErr == ERROR_ALREADY_EXISTS))
+                            ? "EXISTS" : "ERR write-failed");
+            return true;
+        }
+        sendLine(s, "DONE");
+        return true;
     }
 
     void cmdMkdir(SOCKET s, const std::string& path) {

@@ -291,10 +291,13 @@ bool ConvertIsoDateToDateTime(LPCSTR pdatetimefield, LPFILETIME ft)
 bool UnixTimeToLocalTime(const time_t* mtime, LPFILETIME ft)
 {
     if (!mtime || !ft) return false;
-    
+
     struct tm fttm{};
-    if (gmtime_s(&fttm, mtime) != 0) return false;
-    
+    if (gmtime_s(&fttm, mtime) != 0) {
+        SetInt64ToFileTime(ft, FS_TIME_UNKNOWN);
+        return false;
+    }
+
     SYSTEMTIME st{};
     st.wYear   = static_cast<WORD>(fttm.tm_year + 1900);  // tm_year is years since 1900
     st.wMonth  = static_cast<WORD>(fttm.tm_mon + 1);      // tm_mon is 0-11
@@ -302,8 +305,13 @@ bool UnixTimeToLocalTime(const time_t* mtime, LPFILETIME ft)
     st.wHour   = static_cast<WORD>(fttm.tm_hour);
     st.wMinute = static_cast<WORD>(fttm.tm_min);
     st.wSecond = static_cast<WORD>(fttm.tm_sec);
-    
-    return ConvSysTimeToFileTime(&st, ft);
+
+    FILETIME utcFt{};
+    if (!SystemTimeToFileTime(&st, &utcFt) || !FileTimeToLocalFileTime(&utcFt, ft)) {
+        SetInt64ToFileTime(ft, FS_TIME_UNKNOWN);
+        return false;
+    }
+    return true;
 }
 
 void Conv2Chars(LPSTR buf, int nr)

@@ -85,8 +85,10 @@ public:
     Libssh2DirectTcpipStream(
         std::unique_ptr<ISshSession> session,
         std::unique_ptr<ISshChannel> channel,
+        std::unique_ptr<JmpKbdCtx>   kbdCtx,
         SOCKET                       underlyingSocket)
-        : session_(std::move(session))
+        : kbdCtx_(std::move(kbdCtx))
+        , session_(std::move(session))
         , channel_(std::move(channel))
         , sock_(underlyingSocket)
     {}
@@ -189,6 +191,7 @@ public:
     void setDescription(const std::string& d) { desc_ = d; }
 
 private:
+    std::unique_ptr<JmpKbdCtx>   kbdCtx_;
     std::unique_ptr<ISshSession> session_;
     std::unique_ptr<ISshChannel> channel_;
     SOCKET                       sock_   { INVALID_SOCKET };
@@ -457,11 +460,13 @@ std::unique_ptr<ITransportStream> ConnectViaJumpHost(
     // -----------------------------------------------------------------------
     // 2. Create jump SSH session
     // -----------------------------------------------------------------------
-    // We store a JmpKbdCtx in the jump session's abstract so kbd-int works.
-    JmpKbdCtx kbdCtx{ jump.password.c_str() };
+    // Keep kbd-interactive context on the heap so session->abstract never dangles.
+    auto kbdCtx = std::make_unique<JmpKbdCtx>();
+    kbdCtx->password = jump.password.c_str();
 
-    auto jmpSession = backend->createSession(jmp_alloc, jmp_free, jmp_realloc, &kbdCtx);
+    auto jmpSession = backend->createSession(jmp_alloc, jmp_free, jmp_realloc, kbdCtx.get());
     if (!jmpSession) {
+        closesocket(jmpSock);
         ShowStatusId(IDS_LOG_JUMP_SSH_FAIL, nullptr, true);
         if (cs->feedback)
             cs->feedback->ShowError(LngStrU8(IDS_ERR_JUMP_SESSION, "ProxyJump: libssh2 session init failed").c_str());
@@ -509,6 +514,7 @@ std::unique_ptr<ITransportStream> ConnectViaJumpHost(
     // -----------------------------------------------------------------------
     ShowStatus(("Jump host: authenticating as " + jump.user + "...").c_str());
     if (!AuthJumpHost(cs, jmpSession.get(), jump, jmpSock, progress, loop, lasttime)) {
+        kbdCtx->password = nullptr;
         jmpSession->disconnect("auth failed");
         jmpSession->free();
         closesocket(jmpSock);
@@ -516,6 +522,7 @@ std::unique_ptr<ITransportStream> ConnectViaJumpHost(
             cs->feedback->ShowError(("ProxyJump: authentication to jump host failed.\nUser: " + jump.user).c_str());
         return nullptr;
     }
+    kbdCtx->password = nullptr;
 
     // -----------------------------------------------------------------------
     // 5. Open direct-tcpip channel to target
@@ -565,6 +572,7 @@ std::unique_ptr<ITransportStream> ConnectViaJumpHost(
     auto stream = std::make_unique<Libssh2DirectTcpipStream>(
         std::move(jmpSession),
         std::move(channel),
+        std::move(kbdCtx),
         jmpSock);
     stream->setDescription("direct-tcpip:" + targetHost + ":" + std::to_string(targetPort)
                            + "@" + jump.host);

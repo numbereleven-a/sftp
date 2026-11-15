@@ -211,20 +211,38 @@ int SftpConnectProxySocks5(pConnectSettings ConnectSettings, int connecttoport, 
     } else {
         bool numipv6 = false;  // is it an IPv6 numeric address?
         if (IsNumericIPv6(server)) {
-            struct addrinfo hints{};
-            hints.ai_family = AF_INET6;
-            hints.ai_socktype = SOCK_STREAM;
-            sprintf_s(buf.data(), buf.size(), "%d", connecttoport);
-            struct addrinfo* res = nullptr;
-            if (getaddrinfo(server, buf.data(), &hints, &res) == 0) {
-                if (res->ai_addrlen >= sizeof(sockaddr_in6)) {
-                    numipv6 = true;
-                    buf[3] = SOCKS5_ADDR_IPV6;
-                    const sockaddr_in6* addr6 = reinterpret_cast<const sockaddr_in6*>(res->ai_addr);
-                    memcpy(&buf[4], &addr6->sin6_addr, 16);
-                    nrbytes = 4 + 16;
+            std::array<char, 128> ipv6Text{};
+            const char* cleanIp = server;
+            size_t srvLen = strlen(server);
+            if (srvLen >= 2 && server[0] == '[' && server[srvLen - 1] == ']' && srvLen - 2 < ipv6Text.size()) {
+                memcpy(ipv6Text.data(), server + 1, srvLen - 2);
+                ipv6Text[srvLen - 2] = '\0';
+                cleanIp = ipv6Text.data();
+            }
+            struct in6_addr addr6{};
+            if (inet_pton(AF_INET6, cleanIp, &addr6) == 1) {
+                numipv6 = true;
+                buf[3] = SOCKS5_ADDR_IPV6;
+                memcpy(&buf[4], &addr6, 16);
+                nrbytes = 4 + 16;
+            } else {
+                struct addrinfo hints{};
+                hints.ai_family = AF_INET6;
+                hints.ai_socktype = SOCK_STREAM;
+                hints.ai_flags = AI_NUMERICHOST;
+                std::array<char, 16> portBuf{};
+                sprintf_s(portBuf.data(), portBuf.size(), "%d", connecttoport);
+                struct addrinfo* res = nullptr;
+                if (getaddrinfo(cleanIp, portBuf.data(), &hints, &res) == 0) {
+                    if (res->ai_addrlen >= sizeof(sockaddr_in6)) {
+                        numipv6 = true;
+                        buf[3] = SOCKS5_ADDR_IPV6;
+                        const sockaddr_in6* s6 = reinterpret_cast<const sockaddr_in6*>(res->ai_addr);
+                        memcpy(&buf[4], &s6->sin6_addr, 16);
+                        nrbytes = 4 + 16;
+                    }
+                    freeaddrinfo(res);
                 }
-                freeaddrinfo(res);
             }
         }
         if (!numipv6) {
@@ -236,7 +254,7 @@ int SftpConnectProxySocks5(pConnectSettings ConnectSettings, int connecttoport, 
             nrbytes = static_cast<unsigned char>(buf[4]) + 5;
         }
     }
-    *((PWORD)&buf[nrbytes]) = htons(ConnectSettings->customport);
+    *((PWORD)&buf[nrbytes]) = htons(static_cast<u_short>(connecttoport > 0 ? connecttoport : ConnectSettings->customport));
     nrbytes += 2;
 
     mysend(ConnectSettings->sock, buf.data(), nrbytes, 0, progressbuf, progress, ploop, plasttime);
@@ -269,8 +287,9 @@ int SftpConnectProxySocks5(pConnectSettings ConnectSettings, int connecttoport, 
             break;
         case 3:
             nrbytes = myrecv(ConnectSettings->sock, buf.data(), 1, 0, progressbuf, progress, ploop, plasttime);
-            if (nrbytes == 1)
-                needread = buf[0] + 2;
+            if (nrbytes != 1)
+                return -4;
+            needread = static_cast<unsigned char>(buf[0]) + 2;
             break;    // Domain Name+port
         case 4:
             needread = 18;   // IPv6+port

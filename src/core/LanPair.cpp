@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -140,6 +141,7 @@ struct DiscoveryService::Impl {
     std::thread rxThread;
 
     std::mutex peersMu;
+    std::condition_variable peersCv;
     std::unordered_map<std::string, PeerAnnouncement> peers;
 
     void closeSockets() {
@@ -271,6 +273,7 @@ struct DiscoveryService::Impl {
                 const std::lock_guard<std::mutex> lock(peersMu);
                 peers[ann.peerId] = ann;
             }
+            peersCv.notify_all();
             if (onPeer) onPeer(ann);
         }
     }
@@ -339,9 +342,40 @@ bool DiscoveryService::start(const DiscoveryConfig& cfg,
 void DiscoveryService::stop() {
     if (!impl_) return;
     impl_->stop = true;
+    impl_->peersCv.notify_all();
     impl_->closeSockets();
     if (impl_->txThread.joinable()) impl_->txThread.join();
     if (impl_->rxThread.joinable()) impl_->rxThread.join();
+}
+
+bool DiscoveryService::findPeer(const std::string& peerId, PeerAnnouncement* outPeer) const {
+    if (!impl_ || peerId.empty()) return false;
+    const std::lock_guard<std::mutex> lock(impl_->peersMu);
+    const auto it = impl_->peers.find(peerId);
+    if (it == impl_->peers.end()) return false;
+    if (outPeer) *outPeer = it->second;
+    return true;
+}
+
+bool DiscoveryService::waitForPeer(const std::string& peerId,
+                                   std::chrono::milliseconds timeout,
+                                   PeerAnnouncement* outPeer) const {
+    if (!impl_ || peerId.empty()) return false;
+    const auto startTime = std::chrono::steady_clock::now();
+    const auto deadline = startTime + timeout;
+    const auto minFreshTime = startTime - std::chrono::seconds(5);
+    std::unique_lock<std::mutex> lock(impl_->peersMu);
+    auto isReady = [&] {
+        if (impl_->stop.load(std::memory_order_relaxed)) return true;
+        const auto it = impl_->peers.find(peerId);
+        return it != impl_->peers.end() && it->second.lastSeen >= minFreshTime;
+    };
+    impl_->peersCv.wait_until(lock, deadline, isReady);
+    if (impl_->stop.load(std::memory_order_relaxed)) return false;
+    const auto it = impl_->peers.find(peerId);
+    if (it == impl_->peers.end() || it->second.lastSeen < minFreshTime) return false;
+    if (outPeer) *outPeer = it->second;
+    return true;
 }
 
 struct PairServer::Impl {

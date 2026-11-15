@@ -42,7 +42,7 @@ static bool TryGetSecondQuotedPassword(const char* storedPassword, std::string& 
     const char* p = strstr(storedPassword, "\",\"");
     if (!p || p[3] == 0)
         return false;
-    outSecondPassword.assign(p + 3);
+    outSecondPassword.assign(p + 3, storedPassword + len - 1);
     return !outSecondPassword.empty();
 }
 

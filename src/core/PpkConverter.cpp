@@ -833,16 +833,18 @@ static bool BuildTraditionalEcDer(const PpkData& ppk, const std::vector<uint8_t>
 // PEM output
 // ---------------------------------------------------------------------------
 
-static bool WritePem(const char* path, const char* label, const std::vector<uint8_t>& data)
+static bool WritePemToHandle(HANDLE hf, const char* label, const std::vector<uint8_t>& data)
 {
+    if (hf == INVALID_HANDLE_VALUE) return false;
     const size_t maxB64 = data.size() * 2 + 16;
     std::vector<char> b64(maxB64, '\0');
+    struct B64ZeroGuard {
+        std::vector<char>& v;
+        ~B64ZeroGuard() { if (!v.empty()) SecureZeroMemory(v.data(), v.size()); }
+    } b64Guard{b64};
+
     int b64Len = MimeEncodeData(data.data(), data.size(), b64.data(), maxB64);
     if (b64Len <= 0) return false;
-
-    HANDLE hf = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hf == INVALID_HANDLE_VALUE) return false;
 
     bool ok = true;
     auto Write = [&](const void* p, DWORD n) {
@@ -870,9 +872,6 @@ static bool WritePem(const char* path, const char* label, const std::vector<uint
     }
 
     Write(ftr.data(), static_cast<DWORD>(strlen(ftr.data())));
-
-    CloseHandle(hf);
-    if (!ok) DeleteFileA(path);
     return ok;
 }
 
@@ -919,11 +918,19 @@ static bool ConvertPpkToOpenSshImpl(const char* ppkPath, const char* passphrase,
     }
 
     std::vector<uint8_t> privatePlain = ppk.privateBlob;
+    struct ZeroVecGuard {
+        std::vector<uint8_t>& v;
+        ~ZeroVecGuard() { if (!v.empty()) SecureZeroMemory(v.data(), v.size()); }
+    } plainGuard{privatePlain};
 
     if (ppk.version == 2) {
         uint8_t cipherKey[32] = {};
         uint8_t cipherIv[16] = {};
         uint8_t macKey[20] = {};
+        struct KeyGuardV2 {
+            uint8_t (&k)[32]; uint8_t (&iv)[16]; uint8_t (&m)[20];
+            ~KeyGuardV2() { SecureZeroMemory(k, sizeof(k)); SecureZeroMemory(iv, sizeof(iv)); SecureZeroMemory(m, sizeof(m)); }
+        } keyGuardV2{cipherKey, cipherIv, macKey};
         const char* macPass = encrypted ? passphrase : "";
         if (!DerivePpkV2Material(macPass, cipherKey, cipherIv, macKey)) {
             err = PpkConvertError::crypto_error;
@@ -938,15 +945,15 @@ static bool ConvertPpkToOpenSshImpl(const char* ppkPath, const char* passphrase,
             err = PpkConvertError::bad_passphrase_or_mac;
             return false;
         }
-
-        SecureZeroMemory(cipherKey, sizeof(cipherKey));
-        SecureZeroMemory(cipherIv, sizeof(cipherIv));
-        SecureZeroMemory(macKey, sizeof(macKey));
     } else {
         // PPK v3 handling
         uint8_t cipherKey[32] = {};
         uint8_t cipherIv[16] = {};
         uint8_t macKey[32] = {};
+        struct KeyGuardV3 {
+            uint8_t (&k)[32]; uint8_t (&iv)[16]; uint8_t (&m)[32];
+            ~KeyGuardV3() { SecureZeroMemory(k, sizeof(k)); SecureZeroMemory(iv, sizeof(iv)); SecureZeroMemory(m, sizeof(m)); }
+        } keyGuardV3{cipherKey, cipherIv, macKey};
         
         // For encrypted v3 keys: derive key material using Argon2
         // For unencrypted v3 keys: MAC key is empty string (RFC 2104 compliant)
@@ -969,11 +976,6 @@ static bool ConvertPpkToOpenSshImpl(const char* ppkPath, const char* passphrase,
                 err = PpkConvertError::bad_passphrase_or_mac;
                 return false;
             }
-
-            // Clear sensitive data
-            SecureZeroMemory(cipherKey, sizeof(cipherKey));
-            SecureZeroMemory(cipherIv, sizeof(cipherIv));
-            SecureZeroMemory(macKey, sizeof(macKey));
         } else {
             // Unencrypted v3 key - MAC verification is still required in v3!
             // The MAC key is the empty string.
@@ -987,6 +989,7 @@ static bool ConvertPpkToOpenSshImpl(const char* ppkPath, const char* passphrase,
     }
 
     std::vector<uint8_t> pemDer;
+    ZeroVecGuard derGuard{pemDer};
     const char* pemLabel = nullptr;
     if (ppk.algorithm == "ssh-rsa") {
         if (!BuildTraditionalRsaDer(ppk, privatePlain, pemDer)) {
@@ -1021,24 +1024,31 @@ static bool ConvertPpkToOpenSshImpl(const char* ppkPath, const char* passphrase,
     }
     DeleteFileA(tempBase.data());
 
+    if (strlen(tempBase.data()) + 5 > outPemPathLen) {
+        err = PpkConvertError::io_error;
+        return false;
+    }
     strlcpy(outPemPath, tempBase.data(), outPemPathLen - 1);
     strlcat(outPemPath, ".pem", outPemPathLen - 1);
 
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
         L"D:P(A;;FA;;;OW)", SDDL_REVISION_1, &descriptor, nullptr)) {
+        outPemPath[0] = '\0';
         err = PpkConvertError::io_error; return false;
     }
     SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
     HANDLE protectedFile = CreateFileA(outPemPath, GENERIC_WRITE, 0, &security,
                                        CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
     LocalFree(descriptor);
-    if (protectedFile == INVALID_HANDLE_VALUE) { err = PpkConvertError::io_error; return false; }
-    CloseHandle(protectedFile);
+    if (protectedFile == INVALID_HANDLE_VALUE) { outPemPath[0] = '\0'; err = PpkConvertError::io_error; return false; }
 
     PPK_LOG("Writing PEM file: %s label=%s derSize=%zu", outPemPath, pemLabel, pemDer.size());
-    if (!WritePem(outPemPath, pemLabel, pemDer)) {
+    const bool written = WritePemToHandle(protectedFile, pemLabel, pemDer);
+    CloseHandle(protectedFile);
+    if (!written) {
         PPK_LOG_ERROR("WritePem failed");
+        DeleteFileA(outPemPath);
         outPemPath[0] = '\0';
         err = PpkConvertError::io_error;
         return false;

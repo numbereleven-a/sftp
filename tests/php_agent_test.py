@@ -132,6 +132,25 @@ def main():
             check(result[0] == 200 and
                   (root / 'base256' / 'base256.txt').read_bytes() == b'payload',
                   'base-256 TAR size decoded correctly: ' + str(result))
+            dotted_tar = io.BytesIO()
+            with tarfile.open(fileobj=dotted_tar, mode='w') as tar:
+                info = tarfile.TarInfo('a..b.txt')
+                info.size = 6
+                tar.addfile(info, io.BytesIO(b'dotted'))
+            result = request('TAR_EXTRACT', dotted_tar.getvalue(), extra={'path': 'dotted'})
+            check(result[0] == 200 and (root / 'dotted' / 'a..b.txt').read_bytes() == b'dotted',
+                  'dotted filename in TAR extracted cleanly')
+            sparse_file = root / 'sparse9g.bin'
+            with open(sparse_file, 'wb') as f:
+                f.write(b'HDR0')
+            if os.name == 'nt':
+                subprocess.run(['fsutil', 'sparse', 'setflag', str(sparse_file)],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with open(sparse_file, 'r+b') as f:
+                f.seek(9 * 1024 * 1024 * 1024 - 4)
+                f.write(b'END9')
+            check(request('GET', method='GET', extra={'path': 'sparse9g.bin', 'offset': 0, 'length': 4}) == (200, b'HDR0'),
+                  'large (>8 GiB) GET download succeeds')
             with tempfile.TemporaryDirectory(prefix=root.name + '-outside-') as outside:
                 outside_path = Path(outside)
                 (outside_path / 'secret.txt').write_text('outside-test-marker')
@@ -148,6 +167,48 @@ def main():
         finally:
             server.terminate()
             server.wait(timeout=10)
+        if not salt:
+            salted_salt = secrets.token_hex(16)
+            salted_script = source.read_text(encoding='utf-8-sig').replace(
+                "const AGENT_PSK_SALT = '';", "const AGENT_PSK_SALT = '" + salted_salt + "';")
+            salted_dir = root / 'salted_env'
+            salted_dir.mkdir()
+            (salted_dir / 'sftp.php').write_text(salted_script, encoding='utf-8')
+            env2 = os.environ.copy()
+            env2['TC_SFTP_AGENT_PSK'] = password
+            with socket.socket() as listener2:
+                listener2.bind(('127.0.0.1', 0))
+                port2 = listener2.getsockname()[1]
+            server2 = subprocess.Popen([php, '-S', f'127.0.0.1:{port2}', '-t', str(salted_dir)],
+                                       env=env2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(100):
+                    try:
+                        with socket.create_connection(('127.0.0.1', port2), timeout=.1):
+                            break
+                    except OSError:
+                        time.sleep(.05)
+                conn2 = http.client.HTTPConnection('127.0.0.1', port2, timeout=10)
+                conn2.request('GET', '/sftp.php?op=PROBE')
+                probe_resp = json.loads(conn2.getresponse().read().decode())
+                conn2.close()
+                adv_salt = probe_resp['capabilities']['auth']['salt']
+                assert adv_salt == salted_salt
+                salted_key = hashlib.sha256((adv_salt + ':' + password).encode()).hexdigest().encode()
+                stamp, nonce = str(int(time.time())), secrets.token_hex(16)
+                target2 = '/sftp.php?op=LIST'
+                mat2 = '\n'.join(['POST', 'LIST', target2, stamp, nonce, hashlib.sha256(b'').hexdigest()])
+                hdr2 = {'X-SFTP-TS': stamp, 'X-SFTP-NONCE': nonce, 'X-SFTP-SIGNATURE-VERSION': '2',
+                        'X-SFTP-SIGNATURE': hmac.new(salted_key, mat2.encode(), hashlib.sha256).hexdigest()}
+                conn2 = http.client.HTTPConnection('127.0.0.1', port2, timeout=10)
+                conn2.request('POST', target2, b'', hdr2)
+                status2 = conn2.getresponse().status
+                conn2.close()
+                assert status2 == 200, f'env+salt LIST failed with HTTP {status2}'
+                print('PASS env PSK + configured salt negotiation succeeded')
+            finally:
+                server2.terminate()
+                server2.wait(timeout=10)
 
 
 if __name__ == '__main__':

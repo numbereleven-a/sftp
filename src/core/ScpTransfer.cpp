@@ -400,13 +400,14 @@ int ShellScpDownloadFile(pConnectSettings cs,
     bool gotDataHeader = false;
     bool lastWasCr = false;
     std::vector<char> dataBuf(SFTP_MAX_READ_SIZE * 2);
-    const auto start = std::chrono::steady_clock::now();
+    auto lastProgress = std::chrono::steady_clock::now();
 
     while (true) {
         char type = 0;
         if (!scp.ReadByte(type, SFTP_SCP_READ_IDLE_TIMEOUT_MS)) {
             return SFTP_READFAILED;
         }
+        lastProgress = std::chrono::steady_clock::now();
         if (type == 'T') {
             std::string tline;
             if (!scp.ReadLine(tline, SFTP_SCP_READ_IDLE_TIMEOUT_MS) ||
@@ -442,6 +443,7 @@ int ShellScpDownloadFile(pConnectSettings cs,
             return SFTP_READFAILED;
         }
         gotDataHeader = true;
+        lastProgress = std::chrono::steady_clock::now();
 
         int64_t remaining = remoteSize;
         while (remaining > 0) {
@@ -449,6 +451,7 @@ int ShellScpDownloadFile(pConnectSettings cs,
                                                 textMode ? dataBuf.size() / 2 : dataBuf.size());
             int rc = static_cast<int>(scp.get()->read(dataBuf.data(), want));
             if (rc > 0) {
+                lastProgress = std::chrono::steady_clock::now();
                 remaining -= rc;
                 int wlen = rc;
                 if (textMode)
@@ -468,7 +471,7 @@ int ShellScpDownloadFile(pConnectSettings cs,
             } else if (rc == LIBSSH2_ERROR_EAGAIN) {
                 if (EscapePressed()) return SFTP_ABORT;
                 const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - start).count();
+                    std::chrono::steady_clock::now() - lastProgress).count();
                 if (elapsed > SFTP_SCP_READ_IDLE_TIMEOUT_MS) {
                     ShowStatus("SCP download stalled.");
                     return SFTP_READFAILED;

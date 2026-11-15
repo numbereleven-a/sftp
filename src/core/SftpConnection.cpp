@@ -65,44 +65,80 @@ static bool g_lanServerTi = false;
 
 namespace {
 
+struct KeepAliveSlot {
+    std::mutex callMutex;
+    pConnectSettings cs = nullptr;
+    bool cancelled = false;
+};
+
 std::mutex g_keepAliveTimerMutex;
-std::unordered_map<UINT_PTR, pConnectSettings> g_keepAliveTimers;
+std::unordered_map<UINT_PTR, std::shared_ptr<KeepAliveSlot>> g_keepAliveTimers;
 UINT_PTR g_nextKeepAliveTimerId = 0x53465000u;
 
 static HWND KeepAliveTimerWindow() noexcept
 {
-    // Total Commander owns the message loop that must dispatch WM_TIMER.
-    // SFTPplug connection calls can run on a worker thread, where a
-    // thread-owned SetTimer(nullptr, ...) has no message pump.
-    HWND hTcMain = FindWindowA("TTOTAL_CMD", nullptr);
-    if (hTcMain)
-        return hTcMain;
-    return GetForegroundWindow();
+    // Total Commander owns the message loop that dispatches WM_TIMER.
+    // Match a TTOTAL_CMD window owned by this process; avoid foreign windows.
+    const DWORD pid = GetCurrentProcessId();
+    for (HWND h = FindWindowExA(nullptr, nullptr, "TTOTAL_CMD", nullptr);
+         h != nullptr;
+         h = FindWindowExA(nullptr, h, "TTOTAL_CMD", nullptr)) {
+        DWORD wpid = 0;
+        GetWindowThreadProcessId(h, &wpid);
+        if (wpid == pid)
+            return h;
+    }
+    HWND hActive = GetActiveWindow();
+    if (hActive) {
+        DWORD wpid = 0;
+        GetWindowThreadProcessId(hActive, &wpid);
+        if (wpid == pid)
+            return hActive;
+    }
+    return nullptr;
 }
 
 void CALLBACK SshKeepAliveTimerProc(HWND hWnd, UINT, UINT_PTR timerId, DWORD)
 {
-    pConnectSettings cs = nullptr;
+    std::shared_ptr<KeepAliveSlot> slot;
     {
         std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
         const auto it = g_keepAliveTimers.find(timerId);
         if (it != g_keepAliveTimers.end())
-            cs = it->second;
+            slot = it->second;
     }
 
-    if (!cs || !cs->session || !cs->ssh_keepalive_runtime) {
+    if (!slot) {
         KillTimer(hWnd, timerId);
-        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
-        g_keepAliveTimers.erase(timerId);
-        if (cs && cs->ssh_keepalive_timer == timerId)
-            cs->ssh_keepalive_timer = 0;
         return;
     }
 
-    int secondsToNext = 0;
-    const int rc = cs->session->keepaliveSend(&secondsToNext);
-    if (rc != 0 && rc != LIBSSH2_ERROR_EAGAIN)
-        CONN_LOG("SSH keepalive failed rc=%d", rc);
+    bool shouldCancel = false;
+    pConnectSettings staleCs = nullptr;
+    {
+        std::lock_guard<std::mutex> callLock(slot->callMutex);
+        if (slot->cancelled || !slot->cs || !slot->cs->session || !slot->cs->ssh_keepalive_runtime) {
+            shouldCancel = !slot->cancelled;
+            staleCs = slot->cs;
+            slot->cancelled = true;
+            slot->cs = nullptr;
+        } else {
+            int secondsToNext = 0;
+            const int rc = slot->cs->session->keepaliveSend(&secondsToNext);
+            if (rc != 0 && rc != LIBSSH2_ERROR_EAGAIN)
+                CONN_LOG("SSH keepalive failed rc=%d", rc);
+        }
+    }
+
+    if (shouldCancel) {
+        KillTimer(hWnd, timerId);
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
+        const auto it = g_keepAliveTimers.find(timerId);
+        if (it != g_keepAliveTimers.end() && it->second == slot)
+            g_keepAliveTimers.erase(it);
+        if (staleCs && staleCs->ssh_keepalive_timer == timerId)
+            staleCs->ssh_keepalive_timer = 0;
+    }
 }
 
 } // anonymous namespace
@@ -115,25 +151,46 @@ bool StartSshKeepAlive(pConnectSettings cs)
     }
 
     StopSshKeepAlive(cs);
+    const HWND timerWindow = KeepAliveTimerWindow();
+    if (!timerWindow) {
+        CONN_LOG("SSH keepalive skipped: no process UI timer window");
+        return false;
+    }
+
     const unsigned int interval = cs->ssh_keepalive_interval < 5
         ? 5 : (cs->ssh_keepalive_interval > 3600 ? 3600 : cs->ssh_keepalive_interval);
     cs->session->keepaliveConfig(1, interval);
 
-    ++g_nextKeepAliveTimerId;
-    if (g_nextKeepAliveTimerId == 0)
+    UINT_PTR timerId = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
         ++g_nextKeepAliveTimerId;
-    const UINT_PTR timerId = g_nextKeepAliveTimerId;
-    const HWND timerWindow = KeepAliveTimerWindow();
+        if (g_nextKeepAliveTimerId == 0)
+            ++g_nextKeepAliveTimerId;
+        timerId = g_nextKeepAliveTimerId;
+    }
+
+    auto slot = std::make_shared<KeepAliveSlot>();
+    slot->cs = cs;
+    {
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
+        g_keepAliveTimers[timerId] = slot;
+    }
+
     const UINT_PTR actualId = SetTimer(timerWindow, timerId, interval * 1000u, SshKeepAliveTimerProc);
     if (actualId == 0) {
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
+        g_keepAliveTimers.erase(timerId);
         CONN_LOG("SSH keepalive timer creation failed error=%lu", GetLastError());
         return false;
     }
 
-    {
+    if (actualId != timerId) {
         std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
-        g_keepAliveTimers[actualId] = cs;
+        g_keepAliveTimers.erase(timerId);
+        g_keepAliveTimers[actualId] = slot;
     }
+
     cs->ssh_keepalive_timer = actualId;
     cs->ssh_keepalive_timer_thread = GetCurrentThreadId();
     cs->ssh_keepalive_timer_window = timerWindow;
@@ -147,14 +204,26 @@ void StopSshKeepAlive(pConnectSettings cs)
     if (!cs || cs->ssh_keepalive_timer == 0)
         return;
     const UINT_PTR timerId = cs->ssh_keepalive_timer;
-    KillTimer(cs->ssh_keepalive_timer_window, timerId);
-    {
-        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
-        g_keepAliveTimers.erase(timerId);
-    }
+    const HWND timerWindow = cs->ssh_keepalive_timer_window;
     cs->ssh_keepalive_timer = 0;
     cs->ssh_keepalive_timer_thread = 0;
     cs->ssh_keepalive_timer_window = nullptr;
+
+    KillTimer(timerWindow, timerId);
+    std::shared_ptr<KeepAliveSlot> slot;
+    {
+        std::lock_guard<std::mutex> lock(g_keepAliveTimerMutex);
+        const auto it = g_keepAliveTimers.find(timerId);
+        if (it != g_keepAliveTimers.end()) {
+            slot = it->second;
+            g_keepAliveTimers.erase(it);
+        }
+    }
+    if (slot) {
+        std::lock_guard<std::mutex> callLock(slot->callMutex);
+        slot->cancelled = true;
+        slot->cs = nullptr;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -549,35 +618,21 @@ static int LanPairConnect(pConnectSettings cs)
         return SFTP_FAILED;
     }
 
-    std::string foundIp;
-    uint16_t foundPort = 45846;
-
-    // Start a short-lived discovery service to look for the peer.
-    lanpair::DiscoveryService disco;
-    lanpair::DiscoveryConfig dcfg;
-    const std::string localId = MakeLanPeerId();
-    char host[256] = {};
-    gethostname(host, static_cast<int>(sizeof(host) - 1));
-
-    std::mutex mu;
-    std::condition_variable cv;
+    lanpair::PeerAnnouncement foundPeer;
     bool found = false;
-
-    disco.start(dcfg, localId, host, lanpair::PairRole::Dual,
-        [&](const lanpair::PeerAnnouncement& ann) {
-            if (ann.peerId != targetPeerId) return;
-            std::lock_guard<std::mutex> lk(mu);
-            foundIp   = ann.ip;
-            foundPort = ann.tcpPort ? ann.tcpPort : 45846;
-            found     = true;
-            cv.notify_one();
-        });
-
-    {
-        std::unique_lock<std::mutex> lk(mu);
-        cv.wait_for(lk, std::chrono::seconds(4), [&] { return found; });
+    if (g_lanDiscovery) {
+        found = g_lanDiscovery->waitForPeer(targetPeerId, std::chrono::seconds(4), &foundPeer);
+    } else {
+        lanpair::DiscoveryService disco;
+        lanpair::DiscoveryConfig dcfg;
+        const std::string localId = MakeLanPeerId();
+        char host[256] = {};
+        gethostname(host, static_cast<int>(sizeof(host) - 1));
+        if (disco.start(dcfg, localId, host, lanpair::PairRole::Dual, nullptr)) {
+            found = disco.waitForPeer(targetPeerId, std::chrono::seconds(4), &foundPeer);
+            disco.stop();
+        }
     }
-    disco.stop();
 
     if (!found) {
         if (cs->feedback)
@@ -585,8 +640,8 @@ static int LanPairConnect(pConnectSettings cs)
         return SFTP_FAILED;
     }
 
-    cs->lan_pair_ip   = foundIp;
-    cs->lan_pair_port = foundPort;
+    cs->lan_pair_ip   = foundPeer.ip;
+    cs->lan_pair_port = foundPeer.tcpPort ? foundPeer.tcpPort : 45846;
 
     // Register password with our own server BEFORE connecting —
     // the remote peer may simultaneously try to connect to us using the same password.
@@ -600,16 +655,17 @@ static int LanPairConnect(pConnectSettings cs)
     {
         std::string s = LngStrU8(IDS_LAN_CONNECTING, "LAN Pair: connecting to {}...");
         const auto p = s.find("{}");
-        if (p != std::string::npos) s.replace(p, 2, foundIp);
+        if (p != std::string::npos) s.replace(p, 2, foundPeer.ip);
         ShowStatus(s.c_str());
     }
 
     lanpair::PairError err;
+    const std::string localId = MakeLanPeerId();
     const lanpair::PairRole localRole =
         (cs->lan_pair_role == 1) ? lanpair::PairRole::Receiver :
         (cs->lan_pair_role == 2) ? lanpair::PairRole::Donor    : lanpair::PairRole::Dual;
     auto session = LanPairSession::connect(
-        foundIp, foundPort, localId, targetPeerId,
+        foundPeer.ip, cs->lan_pair_port, localId, targetPeerId,
         cs->password,   // empty = use stored trust key
         &err, localRole);
 

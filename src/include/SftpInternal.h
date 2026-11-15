@@ -185,6 +185,7 @@ int SftpAuthPubKey(pConnectSettings ConnectSettings,
 // Shell / channel helpers defined in SftpShell.cpp
 // ---------------------------------------------------------------------------
 void  StripEscapeSequences(LPSTR msgbuf);
+void  StripEscapeSequences(std::string& str);
 std::unique_ptr<ISshChannel> ConnectChannel(ISshSession* session, SOCKET sock = INVALID_SOCKET);
 bool  SendChannelCommand(ISshSession* session, ISshChannel* channel, LPCSTR command, SOCKET sock = INVALID_SOCKET);
 bool  SendChannelCommandNoEof(ISshSession* session, ISshChannel* channel, LPCSTR command, SOCKET sock = INVALID_SOCKET);
@@ -195,6 +196,12 @@ void  CloseScpShell(pConnectSettings cs);
 bool  ScpReadCommandOutput(pConnectSettings cs, const char* endMarker, std::vector<std::string>& outLines, DWORD timeoutMs, const char* beginMarker = nullptr, std::string* endLine = nullptr);
 // 1 = exists, 0 = confirmed missing, -1 = the check failed.
 int SftpFileExistsW(pConnectSettings cs, LPCWSTR path);
+bool  ReadChannelLine(ISshChannel* channel,
+                      std::string& outLine,
+                      std::string& msgbuf, std::string& errbuf,
+                      SOCKET sock = INVALID_SOCKET,
+                      DWORD idleTimeoutMs  = 10000,
+                      DWORD totalTimeoutMs = 45000);
 bool  ReadChannelLine(ISshChannel* channel,
                       char* line, size_t linelen,
                       std::string& msgbuf, std::string& errbuf,

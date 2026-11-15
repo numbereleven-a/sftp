@@ -260,7 +260,6 @@ function op_get(): void
     header('Accept-Ranges: bytes');
 
     // Disable userland output buffering for streaming.
-    tar_preflight($absPath);
     while (ob_get_level() > 0) {
         @ob_end_clean();
     }
@@ -469,7 +468,9 @@ function op_tar_extract(): void
 {
     @set_time_limit(0);
     $relPath = normalize_rel((string)get_param('path', '.'));
-    $absPath = resolve_path_for_create($relPath);
+    $absPath = ($relPath === '.' || $relPath === '')
+        ? root_realpath()
+        : resolve_path_for_create($relPath);
     if (!is_dir($absPath) && !@mkdir($absPath, 0775, true)) {
         fail(500, 'MKDIR_FAILED', 'Cannot create target directory');
     }
@@ -583,11 +584,15 @@ function tar_extract_stream(string $rootAbs, $in): int
         $pax = [];
         if (!in_array($typeflag, ["\0", '0', '5'], true)) fail(400, 'BAD_TAR', 'Unsupported entry type');
         $entryPath = str_replace('\\', '/', trim($entryPath, '/'));
-        if ($entryPath === '' || strpos($entryPath, '..') !== false) {
+        if ($entryPath === '') {
             if ($paddedSize > 0) tar_skip_exact($in, $paddedSize);
             continue;
         }
-        normalize_rel($entryPath);
+        $entryPath = normalize_rel($entryPath);
+        if ($entryPath === '.') {
+            if ($paddedSize > 0) tar_skip_exact($in, $paddedSize);
+            continue;
+        }
         $absTarget = $rootAbs . '/' . $entryPath;
         validate_write_target($absTarget);
         if ($typeflag === '5') {
@@ -637,10 +642,14 @@ function op_tar_pack(): void
     }
 
     $root = root_realpath();
+    $relList = [];
     foreach ($lines as $item) {
-        if (trim($item) === '') continue;
-        $abs = resolve_path(normalize_rel(trim($item)), true);
+        $trimmed = trim((string)$item);
+        if ($trimmed === '') continue;
+        $normRel = normalize_rel($trimmed);
+        $abs = resolve_path($normRel, true);
         if (is_file($abs) && (int)filesize($abs) > 8589934591) fail(413, 'TOO_LARGE', 'File exceeds ustar limit');
+        $relList[] = $normRel;
     }
     set_time_limit(0);
 
@@ -654,11 +663,7 @@ function op_tar_pack(): void
         fail(500, 'MEMORY_FAILED', 'Cannot open output stream');
     }
 
-    foreach ($lines as $relPath) {
-        $relPath = trim((string)$relPath);
-        if ($relPath === '') {
-            continue;
-        }
+    foreach ($relList as $relPath) {
         // Validate: path must resolve inside root
         $abs = $root . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relPath);
         $real = realpath($abs);
@@ -1117,7 +1122,11 @@ function resolve_agent_psk_plain(): string
 function resolve_agent_psk_for_hmac(): string
 {
     $plain = resolve_agent_psk_plain();
-    return $plain !== '' ? hash('sha256', $plain) : resolve_agent_psk_hash();
+    if ($plain !== '') {
+        $salt = resolve_agent_psk_salt();
+        return hash('sha256', $salt !== '' ? ($salt . ':' . $plain) : $plain);
+    }
+    return resolve_agent_psk_hash();
 }
 
 function resolve_agent_psk_hash(): string
@@ -1472,27 +1481,33 @@ function enforce_nonce_once(string $nonce, int $ts): void
         fail(500, 'NONCE_STORAGE_FAILED', 'Nonce cache directory creation failed');
     }
 
-    // Prune old nonce files opportunistically to reduce per-request I/O.
-    {
-        $now = time();
+    // Prune stale nonce files opportunistically to avoid scanning on every request.
+    $now = time();
+    $gcStamp = $base . DIRECTORY_SEPARATOR . '.gc';
+    $lastGc = @filemtime($gcStamp);
+    $runGc = !is_int($lastGc) || ($now - $lastGc) >= 30 || mt_rand(0, 63) === 0;
+    if ($runGc) {
+        @touch($gcStamp, $now);
+        $liveCount = 0;
         $dh = @opendir($base);
         if ($dh !== false) {
             while (($name = readdir($dh)) !== false) {
-                if ($name === '.' || $name === '..') {
+                if ($name === '.' || $name === '..' || $name === '.gc') {
                     continue;
                 }
                 $p = $base . DIRECTORY_SEPARATOR . $name;
                 $mtime = @filemtime($p);
                 if (is_int($mtime) && ($now - $mtime) > (AGENT_NONCE_TTL * 2)) {
                     @unlink($p);
+                } else {
+                    ++$liveCount;
                 }
             }
             closedir($dh);
         }
-    }
-
-    if (count(glob($base . '/*.n') ?: []) >= 10000) {
-        fail(503, 'NONCE_CACHE_FULL', 'Replay storage is full');
+        if ($liveCount >= 10000) {
+            fail(503, 'NONCE_CACHE_FULL', 'Replay storage is full');
+        }
     }
     $key = hash('sha256', $nonce . '|' . $ts);
     $file = $base . DIRECTORY_SEPARATOR . $key . '.n';

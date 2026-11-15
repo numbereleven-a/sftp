@@ -262,16 +262,18 @@ BOOL APIENTRY DllMain( HANDLE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         walcopy(s_quickconnect, s_quickconnectW.data(), countof(s_quickconnect) - 1);
     }
     if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        // Stop LAN services before CRT destroys global objects
-        // LAN services pin this module while workers exist. During process
-        // termination Windows closes their sockets; never join under loader lock.
-        ShutdownMultiServer();
-        if (g_winsockInitialized) {
-            WSACleanup();
-            g_winsockInitialized = false;
+        // Only run teardown on explicit FreeLibrary (lpReserved == nullptr).
+        // Under process termination, loader lock and OS thread teardown make
+        // mutexes, thread joins, WSACleanup, and SymCleanup unsafe.
+        if (lpReserved == nullptr) {
+            ShutdownMultiServer();
+            if (g_winsockInitialized) {
+                WSACleanup();
+                g_winsockInitialized = false;
+            }
+            // Release DbgHelp symbol tables — required for clean reload
+            sftp::ShutdownSymbols();
         }
-        // Release DbgHelp symbol tables — required for clean reload
-        sftp::ShutdownSymbols();
     }
     return true;
 }
@@ -703,22 +705,19 @@ void WINAPI FsStatusInfo(LPCSTR RemoteDir, int InfoStartEnd, int InfoOperation)
                 return;
             }
             std::array<char, MAX_PATH> displayName{};
-            const char* oldpass = nullptr;
+            std::string oldpassCopy;
+            bool isPhpTar = false;
             GetDisplayNameFromPath(RemoteDir, displayName.data(), displayName.size() - 1);
-            // get password from main thread
-            pConnectSettings oldserverid = static_cast<pConnectSettings>(GetServerIdFromName(displayName.data(), mainthreadid));
-            if (oldserverid) {
-                if (InfoOperation == FS_STATUS_OP_PUT_MULTI_THREAD
-                    && IsPhpAgentTransport(oldserverid) && oldserverid->php_tar)
+            // Copy password under registry lock from main thread entry
+            if (TryGetServerConnectInfo(displayName.data(), mainthreadid, &oldpassCopy, &isPhpTar)) {
+                if (InfoOperation == FS_STATUS_OP_PUT_MULTI_THREAD && isPhpTar)
                     TarUploadSessionBegin(nullptr);  // cs filled in by first FsPutFileW
-                if (InfoOperation == FS_STATUS_OP_GET_MULTI_THREAD
-                    && IsPhpAgentTransport(oldserverid) && oldserverid->php_tar)
+                if (InfoOperation == FS_STATUS_OP_GET_MULTI_THREAD && isPhpTar)
                     TarDownloadSessionBegin(nullptr);  // cs filled in by first FsGetFileW
-                oldpass = oldserverid->password.c_str();
-                if (!oldpass[0])
-                    oldpass = nullptr;
             }
+            const char* oldpass = oldpassCopy.empty() ? nullptr : oldpassCopy.c_str();
             pConnectSettings serverid = SftpConnectToServer(displayName.data(), inifilename, oldpass);
+            SecureZeroMemory(oldpassCopy.data(), oldpassCopy.size());
             if (serverid)
                 SetServerIdForName(displayName.data(), static_cast<SERVERID>(serverid));
         }
@@ -740,10 +739,11 @@ void WINAPI FsSetDefaultParams(FsDefaultParamStruct * dps)
 {
     sftp::DllExceptionBarrier _barrier;
     sftp::dll_invoke_void(_barrier, [&] {
-        if (dps) {
-            // Detect wincmd.ini from registry, falling back to the path derived from dps->DefaultIniName.
-            DetectAndApplyLanguage(dps->DefaultIniName);
-        }
+        if (!dps)
+            return;
+
+        // Detect wincmd.ini from registry, falling back to the path derived from dps->DefaultIniName.
+        DetectAndApplyLanguage(dps->DefaultIniName);
 
         strlcpy(inifilename, dps->DefaultIniName, MAX_PATH-1);
         LPSTR p = strrchr(inifilename, '\\');

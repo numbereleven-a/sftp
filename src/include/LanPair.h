@@ -63,6 +63,11 @@ public:
 
     void stop();
 
+    bool findPeer(const std::string& peerId, PeerAnnouncement* outPeer) const;
+    bool waitForPeer(const std::string& peerId,
+                     std::chrono::milliseconds timeout,
+                     PeerAnnouncement* outPeer) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -109,6 +114,11 @@ public:
                PairError* err = nullptr);
 
     void stop();
+
+    bool findPeer(const std::string& peerId, PeerAnnouncement* outPeer) const;
+    bool waitForPeer(const std::string& peerId,
+                     std::chrono::milliseconds timeout,
+                     PeerAnnouncement* outPeer) const;
 
 private:
     struct Impl;

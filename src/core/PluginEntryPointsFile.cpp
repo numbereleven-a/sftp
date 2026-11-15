@@ -419,8 +419,10 @@ int WINAPI FsGetFileW(LPCWSTR RemoteName, LPWSTR LocalName, int CopyFlags, Remot
         // PHP Agent TAR batch download: queue single file instead of downloading individually.
         if (ri && !(ri->Attr & FILE_ATTRIBUTE_DIRECTORY) &&
             !Move && IsPhpAgentTransport(serverid) && serverid->php_tar &&
-            TarDownloadSessionIsActive(serverid))
+            TarDownloadSessionIsActive())
         {
+            if (!TarDownloadSessionIsActive(serverid))
+                TarDownloadSessionBegin(serverid);
             if (TarDownloadSessionQueue(serverid, LocalName, remotedir.data()))
                 return FS_FILE_OK;
         }
