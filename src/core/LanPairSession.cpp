@@ -225,9 +225,12 @@ AuthResult pair1Connect(
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
                reinterpret_cast<const char*>(&keepAlive), sizeof(keepAlive));
 
-    if (!authenticatePeerClient(s, localPeerId, remotePeerId, password, localRole, nullptr)) {
+    if (!authenticatePeerClient(s, localPeerId, remotePeerId, password, localRole, nullptr, err)) {
         closeSocket(s);
-        if (err) { err->code = ERROR_ACCESS_DENIED; err->message = "LAN3 authentication failed; update both peers and pair again."; }
+        if (err && err->message.empty()) {
+            err->code = ERROR_ACCESS_DENIED;
+            err->message = "LAN3 authentication failed; update both peers and pair again.";
+        }
         return result;
     }
     result.sock = s;
@@ -322,36 +325,16 @@ std::unique_ptr<LanPairSession> LanPairSession::connect(
         return nullptr;
     }
 
-    SFTP_LOG("LAN3", "connect() -> pair1Connect %s:%u local=%s remote=%s",
+    SFTP_LOG("LAN3", "connect() -> PAIR3 %s:%u local=%s remote=%s",
              targetIp.c_str(), targetPort, localPeerId.c_str(), remotePeerId.c_str());
     AuthResult ar = pair1Connect(targetIp, targetPort,
                                  localPeerId, remotePeerId, password, err,
                                  false, localRole);
     if (ar.sock == INVALID_SOCKET) {
-        const bool trustUnknown = err && err->message.find("trust-unknown") != std::string::npos;
-        if (trustUnknown) {
-            // Server couldn't verify our stored key (e.g. DPAPI context mismatch after
-            // enabling TrustedInstaller).  Delete the stale client-side key and retry
-            // with TRUSTNEW so the peer issues a fresh shared secret.
-            SFTP_LOG("LAN3", "trust-unknown: deleting stale client key, retrying with TRUSTNEW");
-            lanpair::DpapiSecretStore::deleteSecret(
-                trustKeyForClient(remotePeerId, localPeerId), nullptr);
-            lanpair::PairError retryErr;
-            ar = pair1Connect(targetIp, targetPort,
-                              localPeerId, remotePeerId, password, &retryErr,
-                              true, localRole);
-            if (ar.sock != INVALID_SOCKET) {
-                if (err) { err->code = 0; err->message.clear(); }
-            } else {
-                if (err) *err = retryErr;
-            }
-        }
-        if (ar.sock == INVALID_SOCKET) {
-            SFTP_LOG("LAN3", "pair1Connect FAILED: %s", err ? err->message.c_str() : "?");
-            return nullptr;
-        }
+        SFTP_LOG("LAN3", "PAIR3 connect FAILED: %s", err ? err->message.c_str() : "?");
+        return nullptr;
     }
-    SFTP_LOG("LAN3", "pair1Connect OK, sending LAN3 HELLO");
+    SFTP_LOG("LAN3", "PAIR3 OK, sending LAN3 HELLO");
 
     if (!sendLine(ar.sock, "LAN3 HELLO")) {
         closeSocket(ar.sock);
@@ -1007,10 +990,6 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
         }
 
         setSocketTimeout(client, 300000);
-        // Impersonate only AFTER the peer has authenticated successfully;
-        // unauthenticated connections must never trigger TI token acquisition.
-        const bool ti = trustedInstaller_.load(std::memory_order_relaxed) && AcquireTrustedInstallerToken();
-        struct TiScope { bool active; ~TiScope() { if (active) ReleaseTrustedInstallerToken(); } } tiScope{ti};
 
         std::string helloLine;
         if (!recvLine(client, &helloLine)) { return; }
@@ -1018,6 +997,11 @@ struct LanFileServer::Impl : public std::enable_shared_from_this<Impl> {
         if (hp.size() < 2 || hp[0] != "LAN3" || hp[1] != "HELLO") return;
 
         if (!sendLine(client, "LAN3 READY")) { return; }
+
+        // Impersonate only AFTER the peer has authenticated and opened the
+        // encrypted LAN3 session; TrustedInstaller covers file operations only.
+        const bool ti = trustedInstaller_.load(std::memory_order_relaxed) && AcquireTrustedInstallerToken();
+        struct TiScope { bool active; ~TiScope() { if (active) ReleaseTrustedInstallerToken(); } } tiScope{ti};
 
         serveCommands(client);
     }

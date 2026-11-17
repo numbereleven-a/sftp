@@ -1,5 +1,22 @@
 # Release Notes
 
+## SFTPplug 10.3.1.0
+
+### Security
+
+- Upgraded LAN Pair (`PAIR3`) authentication to SPAKE2 (RFC 9382, P-256) and encrypted all post-handshake control, listing, and file frames with AES-256-GCM using per-direction keys and sequence-numbered IVs.
+- Scoped `LanFileServer` TrustedInstaller impersonation strictly to post-handshake file command execution (`serveCommands`), and removed remaining legacy `trust-unknown` retry leftovers.
+
+### Fixes
+
+- Fixed 0-byte file uploads in PHP Agent mode (`PhpAgentUploadFileW`) so empty files create `.part` via `PUT` before calling `FINALIZE`.
+- Logged PHP Agent transfer failures (`GET`/`PUT`/`FINALIZE`) instead of opening per-file modal error dialogs on top of Total Commander's batch error / *Skip all* handling.
+- Sent `PROBE` unsigned, automatically negotiated `PROBE` before `PhpAgentValidateAuth` and first signed requests, compensated server/client clock skew (`Date` header), and reported an explicit error when the server `sftp.php` is too old to verify signatures.
+
+### Compatibility
+
+- Both LAN Pair computers must be updated to `10.3.1.0` and re-paired with the shared password.
+
 ## SFTPplug 10.3.0.0
 
 ### Fixes

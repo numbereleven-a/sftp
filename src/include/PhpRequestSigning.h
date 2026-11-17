@@ -55,24 +55,29 @@ inline std::optional<std::vector<uint8_t>> PhpHmacSha256(const std::string& key,
 
 inline std::string SignPhpRequest(const std::string& password, const std::string& salt,
     const std::string& method, const std::string& operation, const std::string& target,
-    const std::string& bodyHash)
+    const std::string& bodyHash, int64_t clockOffset = 0)
 {
     if (password.empty() || bodyHash.empty()) return {};
-    const std::string keyMaterial = salt.empty() ? password : salt + ":" + password;
-    const std::string key = RequestDigest::memory(keyMaterial.data(), keyMaterial.size());
+    std::string keyMaterial = salt.empty() ? password : salt + ":" + password;
+    std::string key = RequestDigest::memory(keyMaterial.data(), keyMaterial.size());
+    SecureZeroMemory(keyMaterial.data(), keyMaterial.size());
     if (key.empty()) return {};
     std::array<uint8_t, 16> nonce{};
     if (BCryptGenRandom(nullptr, nonce.data(), static_cast<ULONG>(nonce.size()),
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return {};
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        SecureZeroMemory(key.data(), key.size());
+        return {};
+    }
     constexpr char digits[] = "0123456789abcdef";
     std::string nonceText(32, '0');
     for (size_t i = 0; i < nonce.size(); ++i) {
         nonceText[2*i] = digits[nonce[i] >> 4]; nonceText[2*i+1] = digits[nonce[i] & 15];
     }
-    const std::string stamp = std::to_string(time(nullptr));
+    const std::string stamp = std::to_string(static_cast<long long>(time(nullptr)) + clockOffset);
     const std::string canonical = method + "\n" + operation + "\n" + target +
         "\n" + stamp + "\n" + nonceText + "\n" + bodyHash;
     auto signature = PhpHmacSha256(key, canonical);
+    SecureZeroMemory(key.data(), key.size());
     if (!signature) return {};
     std::string hex(signature->size() * 2, '0');
     for (size_t i = 0; i < signature->size(); ++i) {

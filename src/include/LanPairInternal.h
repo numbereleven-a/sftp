@@ -303,6 +303,16 @@ inline std::vector<uint8_t> derivePairSalt(std::string_view peerIdA,
     return salt;
 }
 
+inline std::optional<std::vector<uint8_t>> derivePairKey(
+    std::string_view password,
+    std::string_view peerIdA,
+    std::string_view peerIdB)
+{
+    if (password.empty()) return std::nullopt;
+    const auto salt = derivePairSalt(peerIdA, peerIdB);
+    return deriveKeyPbkdf2(password, salt, kDerivedKeySize);
+}
+
 // Key / token helpers
 // ---------------------------------------------------------------------------
 
@@ -332,7 +342,7 @@ inline std::string trustKeyForClient(std::string_view serverPeerId,
          + "__" + sanitizeKey(clientPeerId);
 }
 
-// Percent-encode a token for the PAIR1 wire protocol.
+// Percent-encode a token for wire lines.
 inline std::string escapeToken(std::string_view in) {
     std::ostringstream oss;
     for (unsigned char c : in) {
@@ -345,6 +355,23 @@ inline std::string escapeToken(std::string_view in) {
         }
     }
     return oss.str();
+}
+
+inline std::string unescapeToken(std::string_view in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size()) {
+            const auto decoded = hexDecode(in.substr(i + 1, 2));
+            if (decoded && decoded->size() == 1) {
+                out.push_back(static_cast<char>((*decoded)[0]));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(in[i]);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,12 +461,25 @@ inline bool verifyHexMac(const std::optional<std::vector<uint8_t>>& expected,
     return expected && decoded && constantTimeEqual(*expected, *decoded);
 }
 
-// LAN3 authenticates every frame, including responses and file bytes. The
-// session key is challenge-bound and directional keys prevent reflection.
+// LAN3 encrypts and authenticates every frame after the SPAKE2 handshake
+// using per-direction AES-256-GCM keys and monotonic 64-bit sequence IVs.
+} // namespace lanpair_internal
+
+#include "LanPairProtocol.h"
+
+namespace lanpair_internal {
+
 struct LanChannel {
-    std::vector<uint8_t> txKey, rxKey, pending;
+    std::shared_ptr<lanpair_proto::GcmCipher> txCipher;
+    std::shared_ptr<lanpair_proto::GcmCipher> rxCipher;
+    std::vector<uint8_t> pending;
     size_t pendingOffset = 0;
-    uint64_t txSequence = 0, rxSequence = 0;
+
+    ~LanChannel() {
+        if (!pending.empty()) {
+            SecureZeroMemory(pending.data(), pending.size());
+        }
+    }
 };
 inline std::mutex channelsMutex;
 inline std::map<SOCKET, std::shared_ptr<LanChannel>> channels;
@@ -450,16 +490,17 @@ inline std::shared_ptr<LanChannel> channelFor(SOCKET s) {
     return it == channels.end() ? nullptr : it->second;
 }
 
-inline bool secureSocket(SOCKET s, const std::vector<uint8_t>& key, bool server) {
-    auto derive = [&](const char* label) {
-        return hmacSha256(key, std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(label), strlen(label)));
-    };
-    auto c2s = derive("LAN3 client to server"), s2c = derive("LAN3 server to client");
-    if (!c2s || !s2c) return false;
+inline bool secureSocketGcm(SOCKET s, const lanpair_proto::Spake2::Secrets& secrets, bool initiator) {
+    lanpair_proto::ChannelMaterial mat;
+    if (!lanpair_proto::DeriveChannelMaterial(secrets, initiator, mat))
+        return false;
+    auto tx = std::make_shared<lanpair_proto::GcmCipher>();
+    auto rx = std::make_shared<lanpair_proto::GcmCipher>();
+    if (!tx->init(mat.txKey, mat.txSalt) || !rx->init(mat.rxKey, mat.rxSalt))
+        return false;
     auto channel = std::make_shared<LanChannel>();
-    channel->txKey = server ? *s2c : *c2s;
-    channel->rxKey = server ? *c2s : *s2c;
+    channel->txCipher = std::move(tx);
+    channel->rxCipher = std::move(rx);
     std::lock_guard<std::mutex> lock(channelsMutex);
     channels[s] = std::move(channel);
     return true;
@@ -473,50 +514,50 @@ inline void closeSocket(SOCKET s) {
 
 inline bool sendAll(SOCKET s, const uint8_t* data, size_t len) {
     auto channel = channelFor(s);
-    if (!channel) return rawSendAll(s, data, len);
+    if (!channel || !channel->txCipher) return rawSendAll(s, data, len);
+    std::vector<uint8_t> frame;
     while (len) {
-        const size_t n = std::min<size_t>(len, 65536);
-        std::vector<uint8_t> frame(12 + n);
-        const uint32_t size = htonl(static_cast<uint32_t>(n));
-        memcpy(frame.data(), &size, 4);
-        for (size_t i = 0; i < 8; ++i)
-            frame[4 + i] = static_cast<uint8_t>(channel->txSequence >> ((7 - i) * 8));
-        memcpy(frame.data() + 12, data, n);
-        auto mac = hmacSha256(channel->txKey, frame);
-        if (!mac || !rawSendAll(s, frame.data(), frame.size()) ||
-            !rawSendAll(s, mac->data(), mac->size())) return false;
-        ++channel->txSequence;
-        data += n; len -= n;
+        const size_t n = (std::min)(len, lanpair_proto::kMaxFramePlaintext);
+        if (!channel->txCipher->encryptFrame(data, n, frame) ||
+            !rawSendAll(s, frame.data(), frame.size())) {
+            return false;
+        }
+        data += n;
+        len -= n;
     }
     return true;
 }
 
 inline bool receiveBytes(SOCKET s, uint8_t* data, size_t len) {
     auto channel = channelFor(s);
-    if (!channel) return rawRecvAll(s, data, len);
+    if (!channel || !channel->rxCipher) return rawRecvAll(s, data, len);
     while (len) {
         if (channel->pendingOffset == channel->pending.size()) {
-            std::array<uint8_t, 12> header{};
+            std::array<uint8_t, lanpair_proto::kFrameHeaderSize> header{};
             if (!rawRecvAll(s, header.data(), header.size())) return false;
-            uint32_t size; memcpy(&size, header.data(), 4); size = ntohl(size);
-            uint64_t sequence = 0;
-            for (size_t i = 4; i < 12; ++i) sequence = (sequence << 8) | header[i];
-            if (!size || size > 65536 || sequence != channel->rxSequence) return false;
-            std::vector<uint8_t> frame(header.begin(), header.end());
-            frame.resize(12 + size);
-            std::array<uint8_t, 32> supplied{};
-            if (!rawRecvAll(s, frame.data() + 12, size) ||
-                !rawRecvAll(s, supplied.data(), supplied.size())) return false;
-            auto expected = hmacSha256(channel->rxKey, frame);
-            if (!expected || !constantTimeEqual(*expected, supplied)) return false;
-            channel->pending.assign(frame.begin() + 12, frame.end());
+            const uint32_t size = (static_cast<uint32_t>(header[0]) << 24) |
+                                  (static_cast<uint32_t>(header[1]) << 16) |
+                                  (static_cast<uint32_t>(header[2]) << 8)  |
+                                  static_cast<uint32_t>(header[3]);
+            if (!size || size > lanpair_proto::kMaxFramePlaintext) return false;
+            std::vector<uint8_t> ciphertextAndTag(static_cast<size_t>(size) + lanpair_proto::kGcmTagSize);
+            if (!rawRecvAll(s, ciphertextAndTag.data(), ciphertextAndTag.size())) return false;
+            if (!channel->pending.empty())
+                SecureZeroMemory(channel->pending.data(), channel->pending.size());
+            channel->pending.resize(size);
+            if (!channel->rxCipher->decryptFrame(header.data(), ciphertextAndTag.data(), size,
+                                                 channel->pending.data())) {
+                channel->pending.clear();
+                channel->pendingOffset = 0;
+                return false;
+            }
             channel->pendingOffset = 0;
-            ++channel->rxSequence;
         }
         const size_t n = (std::min)(len, channel->pending.size() - channel->pendingOffset);
         memcpy(data, channel->pending.data() + channel->pendingOffset, n);
         channel->pendingOffset += n;
-        data += n; len -= n;
+        data += n;
+        len -= n;
     }
     return true;
 }

@@ -151,13 +151,17 @@ static std::wstring UrlEncodeUtf8(const std::string& v)
     return unicode_util::utf8_to_wstring(out);
 }
 
+static int ProbeAgent(pConnectSettings cs, std::string* outBody, std::string* outError, DWORD* outStatus = nullptr);
+
 static std::wstring PhpAgentAuthHeaders(pConnectSettings cs, const wchar_t* method,
     const wchar_t* operation, const char*, const std::wstring& target, const std::string& bodyHash)
 {
     if (!cs) return {};
+    if (!cs->php_auth_known && ProbeAgent(cs, nullptr, nullptr) != SFTP_OK)
+        return {};
     const std::string headers = SignPhpRequest(cs->password, cs->php_auth_salt,
         unicode_util::wide_to_narrow(method), unicode_util::wide_to_narrow(operation),
-        unicode_util::wide_to_narrow(target.c_str()), bodyHash);
+        unicode_util::wide_to_narrow(target.c_str()), bodyHash, cs->php_clock_offset);
     return unicode_util::utf8_to_wstring(headers);
 }
 
@@ -355,6 +359,22 @@ static bool ConfigurePhpRequest(HINTERNET request)
     return WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy)) != FALSE;
 }
 
+// Parse HTTP Date response header to Unix seconds (0 if absent/unparseable).
+static int64_t ResponseUnixTime(HINTERNET request)
+{
+    SYSTEMTIME st{};
+    DWORD size = sizeof(st);
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_DATE | WINHTTP_QUERY_FLAG_SYSTEMTIME,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &st, &size, WINHTTP_NO_HEADER_INDEX)) {
+        return 0;
+    }
+    FILETIME ft{};
+    if (!SystemTimeToFileTime(&st, &ft))
+        return 0;
+    const int64_t ticks = (static_cast<int64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    return (ticks - 116444736000000000LL) / 10000000LL;
+}
+
 static int SendSimpleRequest(
     pConnectSettings cs,
     const wchar_t* method,
@@ -364,7 +384,8 @@ static int SendSimpleRequest(
     DWORD bodyLen,
     DWORD* outStatus,
     std::string* outBody,
-    const char* sigPath = nullptr)
+    const char* sigPath = nullptr,
+    int64_t* outServerTime = nullptr)
 {
     PHP_LOG("HTTP %ls op=%ls query_len=%u", method ? method : L"", op ? op : L"", (unsigned)query.size());
     AgentUrl url;
@@ -382,14 +403,19 @@ static int SendSimpleRequest(
         return SFTP_FAILED;
 
     std::wstring object = BuildObjectPath(url.object, query);
+    const bool isProbe = op && wcscmp(op, L"PROBE") == 0;
+    const std::wstring headers = isProbe
+        ? std::wstring(L"X-SFTP-OP: PROBE\r\n")
+        : PhpAgentAuthHeaders(cs, method, op, sigPath, object, RequestDigest::memory(body, bodyLen));
+    if (headers.empty())
+        return SFTP_FAILED;
+
     h.request = WinHttpOpenRequest(h.connect, method, object.c_str(), nullptr, WINHTTP_NO_REFERER,
                                    WINHTTP_DEFAULT_ACCEPT_TYPES, url.secure ? WINHTTP_FLAG_SECURE : 0);
     if (!h.request)
         return SFTP_FAILED;
 
-    const std::wstring headers = PhpAgentAuthHeaders(cs, method, op, sigPath, object, RequestDigest::memory(body, bodyLen));
-
-    if (!ConfigurePhpRequest(h.request) || headers.empty()) return SFTP_FAILED;
+    if (!ConfigurePhpRequest(h.request)) return SFTP_FAILED;
     BOOL ok = WinHttpSendRequest(h.request, headers.c_str(), (DWORD)-1L,
                                  (LPVOID)body, bodyLen, bodyLen, 0);
     if (!ok)
@@ -400,6 +426,8 @@ static int SendSimpleRequest(
     DWORD status = 0;
     if (!QueryStatus(h.request, &status))
         return SFTP_FAILED;
+    if (outServerTime)
+        *outServerTime = ResponseUnixTime(h.request);
     PHP_LOG("HTTP status=%lu op=%ls", (unsigned long)status, op ? op : L"");
     if (outStatus)
         *outStatus = status;
@@ -416,17 +444,32 @@ static bool IsHttpSuccess(DWORD code) noexcept
     return code >= 200 && code < 300;
 }
 
+static std::string FormatPhpTransferHttpError(DWORD code, const char* op)
+{
+    if (code == 401 || code == 403) {
+        return PhpFmtStr(IDS_PHP_ERR_WRONG_CREDS_HTTP, "Wrong credentials for PHP Agent (HTTP {}).",
+                         {std::to_string(static_cast<unsigned long>(code))});
+    }
+    return PhpFmtStr(IDS_PHP_ERR_REQUEST_FAILED, "PHP Agent request failed for {} (HTTP {}).",
+                     {op ? op : "operation", std::to_string(static_cast<unsigned long>(code))});
+}
+
+// A failed file transfer is reported by Total Commander (or offered via Skip all);
+// log details instead of opening an extra modal dialog per failed file.
+static void LogPhpAgentTransferError(DWORD code, const char* op)
+{
+    if (code < 400)
+        return;
+    const std::string text = FormatPhpTransferHttpError(code, op);
+    ShowStatus(text.c_str());
+}
+
 static void ReportPhpAgentHttpError(pConnectSettings cs, DWORD code, const char* op)
 {
     if (!cs || !cs->feedback)
         return;
-    if (code == 401 || code == 403) {
-        cs->feedback->ShowError(PhpFmtStr(IDS_PHP_ERR_WRONG_CREDS_HTTP, "Wrong credentials for PHP Agent (HTTP {}).", {std::to_string(static_cast<unsigned long>(code))}),
-                                PhpLngStr(IDS_PHP_AGENT_TITLE, "PHP Agent"));
-        return;
-    }
     if (code >= 400) {
-        cs->feedback->ShowError(PhpFmtStr(IDS_PHP_ERR_REQUEST_FAILED, "PHP Agent request failed for {} (HTTP {}).", {op ? op : "operation", std::to_string(static_cast<unsigned long>(code))}),
+        cs->feedback->ShowError(FormatPhpTransferHttpError(code, op),
                                 PhpLngStr(IDS_PHP_AGENT_TITLE, "PHP Agent"));
     }
 }
@@ -539,7 +582,7 @@ static int StreamDownloadToFile(
 
     DWORD code = 0;
     if (!QueryStatus(h.request, &code) || !IsHttpSuccess(code)) {
-        ReportPhpAgentHttpError(cs, code, "GET");
+        LogPhpAgentTransferError(code, "GET");
         return SFTP_READFAILED;
     }
 
@@ -658,29 +701,93 @@ static int StreamUploadFromFile(
     DWORD code = 0;
     if (!QueryStatus(h.request, &code) || !IsHttpSuccess(code)) {
         if (reportHttpError)
-            ReportPhpAgentHttpError(cs, code, method ? (wcscmp(method, L"PUT") == 0 ? "PUT" : "POST") : "POST");
+            LogPhpAgentTransferError(code, method ? (wcscmp(method, L"PUT") == 0 ? "PUT" : "POST") : "POST");
         return SFTP_WRITEFAILED;
     }
     return SFTP_OK;
 }
 
-} // namespace
-
-int PhpAgentProbe(pConnectSettings cs)
+static int ProbeAgent(pConnectSettings cs, std::string* outBody, std::string* outError, DWORD* outStatus)
 {
-    PHP_LOG("Probe start url='%s'", (cs && !cs->server.empty()) ? cs->server.c_str() : "");
+    if (!cs)
+        return SFTP_FAILED;
     DWORD code = 0;
     std::string body;
-    int rc = SendSimpleRequest(cs, L"GET", L"PROBE", L"op=PROBE", nullptr, 0, &code, &body);
+    int64_t serverTime = 0;
+    const int rc = SendSimpleRequest(cs, L"GET", L"PROBE", L"op=PROBE", nullptr, 0, &code, &body, nullptr, &serverTime);
+    if (outStatus)
+        *outStatus = code;
+    if (rc != SFTP_OK)
+        return rc;
+    if (!IsHttpSuccess(code)) {
+        if (outBody)
+            *outBody = std::move(body);
+        return SFTP_FAILED;
+    }
+
+    int signatureVersion = 0;
+    bool hmacAuth = false;
+    ExtractJsonIntField(body, "signature_version", &signatureVersion);
+    ExtractJsonBoolField(body, "hmac_auth", &hmacAuth);
+    if (signatureVersion != 2 || !hmacAuth) {
+        PHP_LOG("Agent signature_version=%d hmac_auth=%d unsupported", signatureVersion, hmacAuth ? 1 : 0);
+        if (outError) {
+            *outError = PhpLngStr(
+                IDS_PHP_ERR_AGENT_OUTDATED,
+                "The PHP Agent on the server is too old for this plugin version: it does not "
+                "accept signed requests. Upload the sftp.php that comes with the plugin.");
+        }
+        return SFTP_FAILED;
+    }
+
+    std::string salt;
+    ExtractJsonStringField(body, "salt", &salt);
+    cs->php_auth_salt = std::move(salt);
+    cs->php_agent_hmac = true;
+    cs->php_clock_offset = serverTime > 0 ? serverTime - static_cast<int64_t>(std::time(nullptr)) : 0;
+    cs->php_auth_known = true;
+    PHP_LOG("Probe negotiated v2 hmac_auth=1 clock_offset=%lld", static_cast<long long>(cs->php_clock_offset));
+    if (outBody)
+        *outBody = std::move(body);
+    return SFTP_OK;
+}
+
+static std::string DescribeValidationFailure(DWORD code, const std::string& body)
+{
+    std::string serverMsg;
+    ExtractErrorMessage(body, &serverMsg);
+    if (code == 401 || code == 403) {
+        return PhpFmtStr(IDS_PHP_ERR_WRONG_CREDS_HTTP, "Wrong credentials for PHP Agent (HTTP {}).",
+                         {std::to_string(static_cast<unsigned long>(code))});
+    }
+    if (code == 404) {
+        return PhpLngStr(IDS_PHP_ERR_NOT_FOUND,
+                         "PHP agent endpoint not found (HTTP 404).\nCheck URL path/filename and upload sftp.php to that location.");
+    }
+    if (code == 503) {
+        return PhpLngStr(IDS_PHP_ERR_UNCONFIGURED,
+                         "PHP agent is not configured on server (HTTP 503).\nSet AGENT_PSK / AGENT_PSK_SHA256 in sftp.php and upload again.");
+    }
+    if (!serverMsg.empty()) {
+        return PhpFmtStr(IDS_PHP_ERR_REJECTED, "PHP Agent rejected request: {}", {serverMsg});
+    }
+    return PhpFmtStr(IDS_PHP_ERR_VALIDATION, "PHP Agent validation failed (HTTP {}).",
+                     {std::to_string(static_cast<unsigned long>(code))});
+}
+
+} // namespace
+
+int PhpAgentProbe(pConnectSettings cs, std::string* outErrorText)
+{
+    if (outErrorText)
+        outErrorText->clear();
+    PHP_LOG("Probe start url='%s'", (cs && !cs->server.empty()) ? cs->server.c_str() : "");
+    std::string body;
+    const int rc = ProbeAgent(cs, &body, outErrorText);
     if (rc != SFTP_OK)
         return rc;
     if (cs) {
         cs->php_recommended_chunk_mib = 0;
-        cs->php_agent_hmac = false;
-        int signatureVersion = 0;
-        ExtractJsonIntField(body, "signature_version", &signatureVersion);
-        ExtractJsonStringField(body, "salt", &cs->php_auth_salt);
-        if (signatureVersion != 2) return SFTP_FAILED;
         int recBytes = 0;
         if (ExtractJsonIntField(body, "recommended_chunk_size", &recBytes) && recBytes > 0) {
             int recMiB = recBytes / (1024 * 1024);
@@ -690,49 +797,42 @@ int PhpAgentProbe(pConnectSettings cs)
             cs->php_recommended_chunk_mib = recMiB;
             PHP_LOG("Probe recommended chunk parsed=%d MiB", recMiB);
         }
-        bool hmacAuth = false;
-        if (ExtractJsonBoolField(body, "hmac_auth", &hmacAuth)) {
-            cs->php_agent_hmac = hmacAuth;
-            if (!hmacAuth) return SFTP_FAILED;
-            PHP_LOG("Probe hmac_auth=%d", hmacAuth ? 1 : 0);
-        }
     }
-    PHP_LOG("Probe done status=%lu body_len=%u", (unsigned long)code, (unsigned)body.size());
-    return IsHttpSuccess(code) ? SFTP_OK : SFTP_FAILED;
+    PHP_LOG("Probe done body_len=%u", (unsigned)body.size());
+    return SFTP_OK;
 }
 
 int PhpAgentValidateAuth(pConnectSettings cs, std::string& outErrorText)
 {
     outErrorText.clear();
+    if (cs && !cs->php_auth_known) {
+        std::string probeError;
+        std::string probeBody;
+        DWORD probeCode = 0;
+        const int probeRc = ProbeAgent(cs, &probeBody, &probeError, &probeCode);
+        if (probeRc != SFTP_OK) {
+            if (!probeError.empty()) {
+                outErrorText = std::move(probeError);
+            } else if (probeCode >= 400) {
+                outErrorText = DescribeValidationFailure(probeCode, probeBody);
+            } else {
+                outErrorText = PhpLngStr(IDS_PHP_ERR_UNREACHABLE, "Cannot reach PHP agent endpoint.");
+            }
+            return probeRc;
+        }
+    }
+
     DWORD code = 0;
     std::string body;
     const int rc = SendSimpleRequest(cs, L"GET", L"LIST", L"op=LIST&path=.&format=plain", nullptr, 0, &code, &body);
     if (rc != SFTP_OK) {
-        std::array<char, 256> msg{};
-        const int n = LoadStr(msg, IDS_PHP_ERR_UNREACHABLE);
-        outErrorText = (n > 0) ? msg.data() : "Cannot reach PHP agent endpoint.";
+        outErrorText = PhpLngStr(IDS_PHP_ERR_UNREACHABLE, "Cannot reach PHP agent endpoint.");
         return rc;
     }
     if (IsHttpSuccess(code))
         return SFTP_OK;
 
-    std::string serverMsg;
-    ExtractErrorMessage(body, &serverMsg);
-    if (code == 401 || code == 403) {
-        outErrorText = PhpFmtStr(IDS_PHP_ERR_WRONG_CREDS_HTTP, "Wrong credentials for PHP Agent (HTTP {}).", {std::to_string(static_cast<unsigned long>(code))});
-    } else if (code == 404) {
-        std::array<char, 512> msg{};
-        const int n = LoadStr(msg, IDS_PHP_ERR_NOT_FOUND);
-        outErrorText = (n > 0) ? msg.data() : "PHP agent endpoint not found (HTTP 404).\nCheck URL path/filename and upload sftp.php to that location.";
-    } else if (code == 503) {
-        std::array<char, 512> msg{};
-        const int n = LoadStr(msg, IDS_PHP_ERR_UNCONFIGURED);
-        outErrorText = (n > 0) ? msg.data() : "PHP agent is not configured on server (HTTP 503).\nSet AGENT_PSK / AGENT_PSK_SHA256 in sftp.php and upload again.";
-    } else if (!serverMsg.empty()) {
-        outErrorText = PhpFmtStr(IDS_PHP_ERR_REJECTED, "PHP Agent rejected request: {}", {serverMsg});
-    } else {
-        outErrorText = PhpFmtStr(IDS_PHP_ERR_VALIDATION, "PHP Agent validation failed (HTTP {}).", {std::to_string(static_cast<unsigned long>(code))});
-    }
+    outErrorText = DescribeValidationFailure(code, body);
     return SFTP_FAILED;
 }
 
@@ -887,19 +987,19 @@ int PhpAgentUploadFileW(pConnectSettings cs,
             !IsHttpSuccess(hashCode) || !ExtractJsonStringField(hashBody, "hash", &remoteHash) ||
             localHash.empty() || remoteHash != localHash) offset = 0;
     }
-    if (offset == localSize) {
+    if (localSize > 0 && offset == localSize) {
         // Upload data already present in .part, finalize only.
+        // Empty (0-byte) files still need PUT below to create the .part file first.
         DWORD code = 0;
         std::wstring finOnly = BuildQueryPathOnly(L"FINALIZE", pathUtf8);
         int rc = SendSimpleRequest(cs, L"POST", L"FINALIZE", finOnly, nullptr, 0, &code, nullptr, pathUtf8.c_str());
         if (rc != SFTP_OK)
             return rc;
         if (!IsHttpSuccess(code)) {
-            ReportPhpAgentHttpError(cs, code, "FINALIZE");
+            LogPhpAgentTransferError(code, "FINALIZE");
             return SFTP_WRITEFAILED;
         }
-        if (localSize > 0)
-            UpdatePercentBar(cs, 100, localNameW, remoteNameW);
+        UpdatePercentBar(cs, 100, localNameW, remoteNameW);
         return SFTP_OK;
     }
 
@@ -918,7 +1018,7 @@ int PhpAgentUploadFileW(pConnectSettings cs,
         if (cs->php_http_mode == 2)
             return StreamUploadFromFile(cs, query, L"PUT", true, local.get(), start, len, localSize, localNameW, remoteNameW, pathUtf8.c_str());
 
-        int rc = StreamUploadFromFile(cs, query, L"POST", false, local.get(), start, len, localSize, localNameW, remoteNameW);
+        int rc = StreamUploadFromFile(cs, query, L"POST", false, local.get(), start, len, localSize, localNameW, remoteNameW, pathUtf8.c_str());
         if (rc == SFTP_OK)
             return rc;
         return StreamUploadFromFile(cs, query, L"PUT", true, local.get(), start, len, localSize, localNameW, remoteNameW, pathUtf8.c_str());
@@ -948,7 +1048,7 @@ int PhpAgentUploadFileW(pConnectSettings cs,
     if (rc != SFTP_OK)
         return rc;
     if (!IsHttpSuccess(code)) {
-        ReportPhpAgentHttpError(cs, code, "FINALIZE");
+        LogPhpAgentTransferError(code, "FINALIZE");
         return SFTP_WRITEFAILED;
     }
     if (localSize > 0)

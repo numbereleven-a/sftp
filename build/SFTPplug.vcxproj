@@ -74,7 +74,7 @@
       <InlineFunctionExpansion>Disabled</InlineFunctionExpansion>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <DebugInformationFormat>None</DebugInformationFormat>
-      <AdditionalIncludeDirectories>..\src\include;..\src\lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\src\include;..\src\lib;..\thirdparty\mbedtls\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_DEBUG;SFTP_ALLINONE;LIBSSH2_MBEDTLS;LIBSSH2_STATIC;LIBSSH2_API=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
@@ -103,7 +103,7 @@
       <BufferSecurityCheck>true</BufferSecurityCheck>
       <ControlFlowGuard>Guard</ControlFlowGuard>
       <DebugInformationFormat>None</DebugInformationFormat>
-      <AdditionalIncludeDirectories>..\src\include;..\src\lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\src\include;..\src\lib;..\thirdparty\mbedtls\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>NDEBUG;SFTP_ALLINONE;LIBSSH2_MBEDTLS;LIBSSH2_STATIC;LIBSSH2_API=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
@@ -192,6 +192,7 @@
     <ClCompile Include="..\src\core\ConnectionAuth.cpp" />
     <ClCompile Include="..\src\core\SshLibraryLoader.cpp" />
     <ClCompile Include="..\src\core\LanPair.cpp" />
+    <ClCompile Include="..\src\core\LanPairProtocol.cpp" />
     <ClCompile Include="..\src\core\LanPairSession.cpp" />
     <ClCompile Include="..\src\core\TrustedInstallerToken.cpp" />
   </ItemGroup>
@@ -239,6 +240,7 @@
     <ClInclude Include="..\src\include\ConnectionAuth.h" />
     <ClInclude Include="..\src\include\SshLibraryLoader.h" />
     <ClInclude Include="..\src\include\LanPair.h" />
+    <ClInclude Include="..\src\include\LanPairProtocol.h" />
     <ClInclude Include="..\src\include\LanPairSession.h" />
     <ClInclude Include="..\src\include\TrustedInstallerToken.h" />
     <ClInclude Include="..\src\include\third_party\libssh2.h" />

@@ -34,17 +34,13 @@
 </div>
 
 <h2>Trust model — first connection vs. subsequent connections</h2>
-<p>LAN Pair uses a <b>TOFU (Trust On First Use)</b> authentication model. You only need to enter a password once:</p>
+<p>LAN Pair uses a <b>SPAKE2 (RFC 9382, P-256) + AES-256-GCM</b> encrypted channel. You only need to enter the pairing password once:</p>
 <ol>
-  <li><b>First connection:</b> A pairing password is required. Both sides must use the same password.</li>
-  <li>On success, the plugin derives a cryptographic trust key (PBKDF2-HMAC-SHA256, 120,000 iterations) and stores it encrypted on disk via Windows DPAPI — bound to your Windows user account.</li>
-  <li><b>Subsequent connections:</b> The stored trust key is used automatically. No password prompt appears.</li>
+  <li><b>First connection:</b> A non-empty pairing password is required. Both sides must enter the same password. Neither the password nor a reusable verifier crosses the wire.</li>
+  <li>On success, the plugin stores the derived pair key (PBKDF2-HMAC-SHA256, 120,000 iterations) encrypted on disk via Windows DPAPI — bound to your Windows user account.</li>
+  <li><b>Subsequent connections:</b> The stored key authenticates a fresh SPAKE2 handshake and derives per-direction AES-256-GCM keys for all listings, filenames, and file transfers.</li>
 </ol>
-<p>Trust is stored per peer pair. Removing a session or switching Windows accounts requires re-pairing with a password.</p>
-
-<div class="note">
-  <b>Note:</b> The pairing password can be left empty if both machines agree on an empty password. In that case, trust is still established cryptographically — but an empty password offers no brute-force resistance. Use a real password on any network you do not fully control.
-</div>
+<p>Trust is stored per peer pair. Both machines must use v10.3.1.0 or newer; removing a session or switching Windows accounts requires re-pairing with the password.</p>
 
 <h2>Roles</h2>
 <ul>

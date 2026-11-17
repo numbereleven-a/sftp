@@ -136,6 +136,8 @@ struct tConnectSettings {
     uint16_t lan_pair_port = 45846; // TCP port of remote peer's file server
     int lan_pair_timeout_min = 0;         // 0=no limit
     std::string php_auth_salt;
+    bool php_auth_known = false;
+    int64_t php_clock_offset = 0;
     bool lan_pair_trusted_installer = false; // impersonate NT SERVICE\TrustedInstaller on connect
     std::unique_ptr<LanPairSession> lanSession; // active file session (nullptr when disconnected)
 

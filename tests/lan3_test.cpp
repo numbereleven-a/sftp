@@ -3,13 +3,16 @@
 #include "LanPairSession.h"
 #include "LanPairInternal.h"
 #include "LanPairAuth.h"
+#include "LanPairProtocol.h"
 #include "ProfileSettings.h"
 #include "SftpClient.h"
 #include "IsolatedAppData.h"
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <chrono>
+#include <future>
 #include <thread>
 
 // These synthetic profiles do not contain passwords.
@@ -24,6 +27,98 @@ int main() {
     std::cout << std::unitbuf;
     IsolatedAppData isolated;
     lanpair_internal::WsaScope wsa;
+
+    // 1. RFC 9382 P-256 SPAKE2 test vector.
+    {
+        auto hexVec = [](const char* h) {
+            auto d = lanpair_internal::hexDecode(h);
+            return d ? *d : std::vector<uint8_t>{};
+        };
+        auto hexEq = [&](auto&& arr, const char* h) {
+            const auto d = hexVec(h);
+            return d.size() == arr.size() && std::equal(arr.begin(), arr.end(), d.begin());
+        };
+        const auto w = hexVec("2ee57912099d31560b3a44b1184b9b4866e904c49d12ac5042c97dca461b1a5f");
+        const auto x = hexVec("43dd0fd7215bdcb482879fca3220c6a968e66d70b1356cac18bb26c84a78d729");
+        const auto y = hexVec("dcb60106f276b02606d8ef0a328c02e4b629f84f89786af5befb0bc75b6e66be");
+        lanpair_proto::Spake2 a(lanpair_proto::Spake2::Role::A, "server", "client", w, x);
+        lanpair_proto::Spake2 b(lanpair_proto::Spake2::Role::B, "server", "client", w, y);
+        check(a.ok() && b.ok(), "SPAKE2 RFC 9382 init succeeded");
+        check(a.finish(b.share(), "") && b.finish(a.share(), ""), "SPAKE2 RFC 9382 finish succeeded");
+        check(hexEq(a.secrets().transcriptHash, "0e0672dc86f8e45565d338b0540abe6915bdf72e2b35b5c9e5663168e960a91b"),
+              "SPAKE2 RFC 9382 transcript hash matches");
+        check(hexEq(a.secrets().ke, "0e0672dc86f8e45565d338b0540abe69"), "SPAKE2 RFC 9382 Ke matches");
+        check(hexEq(a.secrets().ka, "15bdf72e2b35b5c9e5663168e960a91b"), "SPAKE2 RFC 9382 Ka matches");
+        check(hexEq(a.secrets().kcA, "00c12546835755c86d8c0db7851ae86f"), "SPAKE2 RFC 9382 KcA matches");
+        check(hexEq(a.secrets().kcB, "a9fa3406c3b781b93d804485430ca27a"), "SPAKE2 RFC 9382 KcB matches");
+        check(hexEq(a.confirmation(), "58ad4aa88e0b60d5061eb6b5dd93e80d9c4f00d127c65b3b35b1b5281fee38f0"),
+              "SPAKE2 RFC 9382 cA matches");
+        check(hexEq(b.confirmation(), "d3e2e547f1ae04f2dbdbf0fc4b79f8ecff2dff314b5d32fe9fcef2fb26dc459b"),
+              "SPAKE2 RFC 9382 cB matches");
+        check(a.secrets().transcriptHash == b.secrets().transcriptHash &&
+              a.checkPeerConfirmation(b.confirmation()) && b.checkPeerConfirmation(a.confirmation()),
+              "SPAKE2 RFC 9382 mutual key confirmation matches");
+
+        // Mismatched passwords and invalid curve points must fail.
+        const std::vector<uint8_t> otherW(32, 0xA5);
+        lanpair_proto::Spake2 c(lanpair_proto::Spake2::Role::A, "server", "client", w);
+        lanpair_proto::Spake2 d(lanpair_proto::Spake2::Role::B, "server", "client", otherW);
+        check(c.ok() && d.ok() && c.finish(d.share(), "aad") && d.finish(c.share(), "aad") &&
+              !c.checkPeerConfirmation(d.confirmation()) && !d.checkPeerConfirmation(c.confirmation()),
+              "SPAKE2 mismatched keys fail confirmation");
+        std::vector<uint8_t> badPoint(65, 0x04);
+        lanpair_proto::Spake2 e(lanpair_proto::Spake2::Role::A, "server", "client", w);
+        check(!e.finish(badPoint, "aad"), "SPAKE2 rejects off-curve share");
+        std::vector<uint8_t> infinityPoint = {0x00};
+        check(!e.finish(infinityPoint, "aad"), "SPAKE2 rejects infinity/short share");
+
+        // AES-256-GCM frame encryption: confidentiality, tamper, replay, reorder.
+        lanpair_proto::ChannelMaterial matA, matB;
+        check(lanpair_proto::DeriveChannelMaterial(a.secrets(), true, matA) &&
+              lanpair_proto::DeriveChannelMaterial(b.secrets(), false, matB),
+              "channel material derived for both sides");
+        lanpair_proto::GcmCipher txA, rxB;
+        check(txA.init(matA.txKey, matA.txSalt) && rxB.init(matB.rxKey, matB.rxSalt),
+              "AES-256-GCM ciphers initialized");
+        const std::string secretPayload = "SECRET-PAYLOAD-LINE\n";
+        std::vector<uint8_t> frame0, frame1;
+        check(txA.encryptFrame(reinterpret_cast<const uint8_t*>(secretPayload.data()), secretPayload.size(), frame0),
+              "AES-256-GCM encrypts frame 0");
+        check(std::string(frame0.begin(), frame0.end()).find("SECRET-PAYLOAD") == std::string::npos,
+              "encrypted frame hides plaintext");
+        check(txA.encryptFrame(reinterpret_cast<const uint8_t*>(secretPayload.data()), secretPayload.size(), frame1),
+              "AES-256-GCM encrypts frame 1");
+
+        // Tamper ciphertext, tag, and length header; verify rejection.
+        auto tamperedCt = frame0;
+        tamperedCt[lanpair_proto::kFrameHeaderSize] ^= 0x01;
+        std::vector<uint8_t> plain(secretPayload.size());
+        {
+            lanpair_proto::GcmCipher rxCheck;
+            rxCheck.init(matB.rxKey, matB.rxSalt);
+            check(!rxCheck.decryptFrame(tamperedCt.data(), tamperedCt.data() + 4, secretPayload.size(), plain.data()),
+                  "AES-256-GCM rejects tampered ciphertext");
+        }
+        {
+            auto tamperedTag = frame0;
+            tamperedTag.back() ^= 0x01;
+            lanpair_proto::GcmCipher rxCheck;
+            rxCheck.init(matB.rxKey, matB.rxSalt);
+            check(!rxCheck.decryptFrame(tamperedTag.data(), tamperedTag.data() + 4, secretPayload.size(), plain.data()),
+                  "AES-256-GCM rejects tampered tag");
+        }
+        {
+            lanpair_proto::GcmCipher rxReorder;
+            rxReorder.init(matB.rxKey, matB.rxSalt);
+            check(!rxReorder.decryptFrame(frame1.data(), frame1.data() + 4, secretPayload.size(), plain.data()),
+                  "AES-256-GCM rejects reordered frame");
+        }
+        check(rxB.decryptFrame(frame0.data(), frame0.data() + 4, secretPayload.size(), plain.data()) &&
+              std::string(plain.begin(), plain.end()) == secretPayload,
+              "AES-256-GCM decrypts frame 0");
+        check(!rxB.decryptFrame(frame0.data(), frame0.data() + 4, secretPayload.size(), plain.data()),
+              "AES-256-GCM rejects replayed frame 0");
+    }
     const auto profileFile = isolated.path / "profiles.ini";
     for (int role = 0; role <= 2; ++role) {
         const std::string name = "role" + std::to_string(role);
@@ -102,16 +197,47 @@ int main() {
             std::string response;
             lanpair_internal::recvLine(altered, &response);
             auto channel = lanpair_internal::channelFor(altered);
-            std::vector<uint8_t> frame(12 + 6);
-            uint32_t length = htonl(6); memcpy(frame.data(), &length, 4);
-            for (size_t i = 0; i < 8; ++i) frame[4+i] = static_cast<uint8_t>(channel->txSequence >> ((7-i)*8));
-            memcpy(frame.data() + 12, "ROOTS\n", 6);
-            auto mac = lanpair_internal::hmacSha256(channel->txKey, frame);
-            frame[12] ^= 1;
+            const std::string cmd = "ROOTS\n";
+            std::vector<uint8_t> frame;
+            check(channel && channel->txCipher &&
+                  channel->txCipher->encryptFrame(reinterpret_cast<const uint8_t*>(cmd.data()), cmd.size(), frame),
+                  "tamper test encrypted frame");
+            frame[lanpair_proto::kFrameHeaderSize] ^= 1;
             lanpair_internal::rawSendAll(altered, frame.data(), frame.size());
-            lanpair_internal::rawSendAll(altered, mac->data(), mac->size());
-            check(!lanpair_internal::recvLine(altered, &response), "modified authenticated frame rejected");
+            check(!lanpair_internal::recvLine(altered, &response), "modified encrypted frame rejected");
             lanpair_internal::closeSocket(altered);
+        }
+    }
+    {
+        auto connectRaw = [&]() {
+            SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(45986);
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (::connect(s, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+                closesocket(s);
+                return INVALID_SOCKET;
+            }
+            return s;
+        };
+        SOCKET legacyPair1 = connectRaw();
+        if (legacyPair1 != INVALID_SOCKET) {
+            lanpair_internal::rawSendAll(legacyPair1, reinterpret_cast<const uint8_t*>("PAIR1 HELLO old 0 00\n"), 21);
+            std::string resp;
+            check(lanpair_internal::recvLine(legacyPair1, &resp) && resp == "PAIR1 FAIL upgrade-required",
+                  "legacy PAIR1 peer receives upgrade-required");
+            closesocket(legacyPair1);
+        } else {
+            check(false, "legacy PAIR1 socket connected");
+        }
+        SOCKET oldPair3 = connectRaw();
+        if (oldPair3 != INVALID_SOCKET) {
+            lanpair_internal::rawSendAll(oldPair3, reinterpret_cast<const uint8_t*>("PAIR3 HELLO old 0 00\n"), 21);
+            std::string resp;
+            check(lanpair_internal::recvLine(oldPair3, &resp) && resp == "PAIR3 FAIL upgrade-required",
+                  "pre-10.3.1 PAIR3 HELLO peer receives upgrade-required");
+            closesocket(oldPair3);
+        } else {
+            check(false, "pre-10.3.1 PAIR3 socket connected");
         }
     }
     // Preserve existing destination across insufficient-space and interrupted overwrites.

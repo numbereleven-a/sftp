@@ -395,7 +395,9 @@ struct PairServer::Impl {
     }
 
     bool authenticateClient(SOCKET s, PairSessionInfo* info) {
-        return authenticatePeerServer(s, cfg.peerId, cfg.password, info);
+        if (cfg.password.empty())
+            return false;
+        return authenticatePeerServer(s, cfg.peerId, cfg.password, info, false);
     }
 
     void runAcceptLoop() {
@@ -521,9 +523,10 @@ bool PairClient::connectAndAuthenticate(const PairClientConfig& cfg,
         return false;
     }
 
-    const bool ok = authenticatePeerClient(s, cfg.peerId, "", cfg.password, cfg.role, outInfo);
+    const bool ok = authenticatePeerClient(s, cfg.peerId, "", cfg.password, cfg.role, outInfo, err);
     if (outInfo) outInfo->remoteIp = cfg.targetIp;
-    if (!ok) setErr(err, ERROR_ACCESS_DENIED, "LAN3 authentication failed; update both peers and pair again.");
+    if (!ok && err && err->message.empty())
+        setErr(err, ERROR_ACCESS_DENIED, "LAN3 authentication failed; update both peers and pair again.");
     closeSocket(s);
     return ok;
 }
@@ -597,8 +600,8 @@ bool loadSecret(const std::string& key,
     if (!plain) {
         // File is readable but DPAPI can't decrypt it — almost certainly a user-context
         // mismatch (e.g. key was saved under a normal user account, now loaded under
-        // TrustedInstaller or a different session).  Delete the stale file so the next
-        // connection triggers TRUSTNEW and re-establishes keys in the current context.
+        // TrustedInstaller or a different session).  Delete the stale file; the next
+        // connection made with the pairing password re-establishes keys in this context.
         const DWORD dpapiErr = GetLastError();  // capture before remove() resets it
         std::error_code ec2;
         std::filesystem::remove(path, ec2);

@@ -891,6 +891,7 @@ BEGIN
     IDS_IMP_ERR_NO_WINSCP_INI    "WinSCP.ini not found in the selected folder."
     IDS_IMP_BROWSE_KITTY_FOLDER  "Select KiTTY Portable folder"
     IDS_LAN_ERR_DONOR_NO_CONNECT "LAN Pair: this machine is configured as Donor. The remote Receiver must connect here."
+    IDS_PHP_ERR_AGENT_OUTDATED   "The PHP Agent on the server is too old for this plugin version: it does not accept signed requests. Upload the sftp.php that comes with the plugin."
 END
 
 #endif    // English (United States) resources

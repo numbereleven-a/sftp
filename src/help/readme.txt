@@ -1,4 +1,4 @@
-﻿SFTP Plugin for Total Commander v10.3.0.0
+﻿SFTP Plugin for Total Commander v10.3.1.0
 Copyright (C) 2026 Marek Wesolowski - WESMAR
 Repository: https://github.com/numbereleven-a/sftp-totalcommander
 

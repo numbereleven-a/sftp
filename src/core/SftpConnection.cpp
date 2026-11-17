@@ -696,11 +696,15 @@ int SftpConnect(pConnectSettings ConnectSettings)
     }
     if (IsPhpAgentTransport(ConnectSettings)) {
         ShowStatusId(IDS_LOG_PHP_AGENT_MODE, nullptr, true);
-        if (PhpAgentProbe(ConnectSettings) != SFTP_OK) {
+        std::string probeError;
+        if (PhpAgentProbe(ConnectSettings, &probeError) != SFTP_OK) {
             if (ConnectSettings->feedback) {
-                std::array<char, 256> msgbuf{};
-                const int n = LoadStr(msgbuf, IDS_PHP_PROBE_FAILED);
-                ConnectSettings->feedback->ShowError(n > 0 ? msgbuf.data() : "PHP Agent probe failed. Check URL and key.");
+                if (probeError.empty()) {
+                    std::array<char, 256> msgbuf{};
+                    const int n = LoadStr(msgbuf, IDS_PHP_PROBE_FAILED);
+                    probeError = n > 0 ? msgbuf.data() : "PHP Agent probe failed. Check URL and key.";
+                }
+                ConnectSettings->feedback->ShowError(probeError);
             }
             return SFTP_FAILED;
         }

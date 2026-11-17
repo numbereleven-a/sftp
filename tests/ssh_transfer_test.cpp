@@ -4,6 +4,8 @@
 #include "PluginEntryPointsInternal.h"
 #include "ScpTransfer.h"
 #include "PhpAgentClient.h"
+#include "PhpRequestSigning.h"
+#include "IUserFeedback.h"
 #include "ProxyNegotiator.h"
 #include "ServerRegistry.h"
 #include "CoreUtils.h"
@@ -381,14 +383,34 @@ int wmain(int argc, wchar_t** argv) {
           "multiline shell upload resumes at an exact byte offset across chunk boundaries");
     writeFile(local, bytes);
     if (argc == 4) {
+        struct CountingFeedback : IUserFeedback {
+            int errorDialogs = 0;
+            void ShowError(const std::string&, const std::string&) override { ++errorDialogs; }
+            void ShowMessage(const std::string&, const std::string&) override {}
+            bool AskYesNo(const std::string&, const std::string&) override { return false; }
+            bool RequestText(const std::string&, const std::string&, std::string&, bool) override { return false; }
+        };
+        auto* fb = new CountingFeedback();
         auto* php = new tConnectSettings{};
         php->transfermode = static_cast<int>(sftp::TransferMode::php_agent);
         php->server = "http://127.0.0.1:" + std::to_string(_wtoi(argv[3])) + "/sftp.php";
         php->password = "synthetic-pass";
         php->DisplayName = "php";
+        php->feedback.reset(fb);
         SetServerIdForName("php", php);
         check(PhpAgentProbe(php) == SFTP_OK, "production PHP agent negotiation succeeds");
         check(SftpUploadFileW(php, local.c_str(), L"/source.bin", false, false) == SFTP_OK, "signed PHP upload succeeds");
+        const auto emptyLocal = root / "empty.bin";
+        const auto emptyDownload = root / "empty-dl.bin";
+        writeFile(emptyLocal, "");
+        check(SftpUploadFileW(php, emptyLocal.c_str(), L"/empty.bin", false, false) == SFTP_OK &&
+              SftpFileExistsW(php, L"/empty.bin") == 1 &&
+              SftpDownloadFileW(php, L"/empty.bin", emptyDownload.c_str(), true, 0, nullptr, false) == SFTP_OK &&
+              readFile(emptyDownload).empty(),
+              "PHP 0-byte upload and download succeed");
+        check(SftpDownloadFileW(php, L"/does-not-exist.bin", download.c_str(), true, 10, nullptr, false) != SFTP_OK &&
+              fb->errorDialogs == 0,
+              "PHP transfer failure does not pop an extra modal dialog");
         check(SftpFileExistsW(php, L"/source.bin") == 1 && SftpFileExistsW(php, L"/missing.bin") == 0,
               "PHP destination probe distinguishes existing and missing files");
         info.Size64 = bytes.size();
@@ -418,9 +440,141 @@ int wmain(int argc, wchar_t** argv) {
               readFile(dlBatchA) == "multi-dir-A" &&
               readFile(dlBatchB) == "multi-dir-B",
               "PHP TAR batch download adopts session for GET_MULTI_THREAD pattern");
+        tConnectSettings freshAuth{};
+        freshAuth.transfermode = static_cast<int>(sftp::TransferMode::php_agent);
+        freshAuth.server = php->server;
+        freshAuth.password = "synthetic-pass";
+        std::string validateErr;
+        check(PhpAgentValidateAuth(&freshAuth, validateErr) == SFTP_OK && freshAuth.php_auth_known,
+              "PhpAgentValidateAuth auto-negotiates PROBE before LIST");
         php->password = "wrong-synthetic-pass";
         check(SftpFileExistsW(php, L"/missing.bin") == -1, "PHP authentication failure is not treated as a missing file");
+        check(SftpUploadFileW(php, local.c_str(), L"/denied.bin", false, false) != SFTP_OK &&
+              fb->errorDialogs == 0,
+              "PHP upload auth failure logs without extra modal dialog");
         SetServerIdForName("php", nullptr);
+
+        // Mock HTTP peers for outdated agent detection and Date header clock skew compensation.
+        auto runHttpTestPeer = [](auto handler) {
+            SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            int len = sizeof(addr);
+            ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            ::listen(listener, 4);
+            ::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len);
+            const uint16_t port = ntohs(addr.sin_port);
+            auto stopFlag = std::make_shared<std::atomic<bool>>(false);
+            std::thread worker([listener, handler, stopFlag] {
+                while (!stopFlag->load(std::memory_order_relaxed)) {
+                    fd_set set; FD_ZERO(&set); FD_SET(listener, &set);
+                    timeval tv{0, 50000};
+                    if (::select(0, &set, nullptr, nullptr, &tv) <= 0) continue;
+                    SOCKET s = ::accept(listener, nullptr, nullptr);
+                    if (s == INVALID_SOCKET) break;
+                    std::string req;
+                    char buf[1024];
+                    while (req.find("\r\n\r\n") == std::string::npos) {
+                        const int n = ::recv(s, buf, sizeof(buf), 0);
+                        if (n <= 0) break;
+                        req.append(buf, n);
+                    }
+                    const std::string resp = handler(req);
+                    ::send(s, resp.data(), static_cast<int>(resp.size()), 0);
+                    ::shutdown(s, SD_BOTH);
+                    ::closesocket(s);
+                }
+            });
+            struct PeerHandle {
+                uint16_t port;
+                SOCKET listener;
+                std::shared_ptr<std::atomic<bool>> stop;
+                std::thread worker;
+                ~PeerHandle() {
+                    stop->store(true, std::memory_order_relaxed);
+                    ::closesocket(listener);
+                    if (worker.joinable()) worker.join();
+                }
+            };
+            return PeerHandle{port, listener, stopFlag, std::move(worker)};
+        };
+
+        {
+            auto peer = runHttpTestPeer([](const std::string&) {
+                const std::string body = R"({"ok":true,"capabilities":{"auth":{"signature_version":1,"hmac_auth":false}}})";
+                return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+            });
+            tConnectSettings oldAgent{};
+            oldAgent.transfermode = static_cast<int>(sftp::TransferMode::php_agent);
+            oldAgent.server = "http://127.0.0.1:" + std::to_string(peer.port) + "/sftp.php";
+            oldAgent.password = "synthetic-pass";
+            std::string probeErr, authErr;
+            check(PhpAgentProbe(&oldAgent, &probeErr) != SFTP_OK && probeErr.find("sftp.php") != std::string::npos,
+                  "outdated PHP agent is detected with actionable message");
+            check(PhpAgentValidateAuth(&oldAgent, authErr) != SFTP_OK && authErr.find("sftp.php") != std::string::npos,
+                  "PhpAgentValidateAuth surfaces outdated PHP agent error");
+        }
+        {
+            // Future Date header (+3600s) must be applied to X-SFTP-TS and signed with the PROBE salt.
+            const time_t skewed = std::time(nullptr) + 3600;
+            std::tm gmt{};
+            gmtime_s(&gmt, &skewed);
+            static constexpr const char* kDays[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+            static constexpr const char* kMonths[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+            char dateBuf[64]{};
+            snprintf(dateBuf, sizeof(dateBuf), "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                     kDays[gmt.tm_wday], gmt.tm_mday, kMonths[gmt.tm_mon],
+                     gmt.tm_year + 1900, gmt.tm_hour, gmt.tm_min, gmt.tm_sec);
+            const std::string dateHeader = dateBuf;
+            bool probeUnsigned = false;
+            bool listClockCompensated = false;
+            bool listSaltMatched = false;
+            auto peer = runHttpTestPeer([&](const std::string& req) {
+                if (req.find("op=PROBE") != std::string::npos) {
+                    probeUnsigned = (req.find("X-SFTP-SIGNATURE") == std::string::npos);
+                    const std::string body = R"({"ok":true,"capabilities":{"recommended_chunk_size":1048576,"auth":{"signature_version":2,"hmac_auth":true,"salt":"skew-salt"}}})";
+                    return "HTTP/1.1 200 OK\r\nDate: " + dateHeader +
+                           "\r\nContent-Type: application/json\r\nContent-Length: " +
+                           std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+                }
+                auto getHdr = [&](const char* name) {
+                    const std::string key = std::string(name) + ": ";
+                    const size_t pos = req.find(key);
+                    if (pos == std::string::npos) return std::string{};
+                    const size_t end = req.find("\r\n", pos);
+                    return req.substr(pos + key.size(), end - (pos + key.size()));
+                };
+                const std::string tsStr = getHdr("X-SFTP-TS");
+                const std::string nonce = getHdr("X-SFTP-NONCE");
+                const std::string sig = getHdr("X-SFTP-SIGNATURE");
+                const long long sentTs = std::atoll(tsStr.c_str());
+                listClockCompensated = (std::llabs(sentTs - static_cast<long long>(skewed)) <= 5);
+                const std::string keyMat = "skew-salt:synthetic-pass";
+                const std::string hmacKey = RequestDigest::memory(keyMat.data(), keyMat.size());
+                const std::string emptyHash = RequestDigest::memory(nullptr, 0);
+                const std::string base = "GET\nLIST\n/sftp.php?op=LIST&path=.&format=plain\n" +
+                    tsStr + "\n" + nonce + "\n" + emptyHash;
+                auto expectedMac = PhpHmacSha256(hmacKey, base);
+                if (expectedMac) {
+                    static constexpr char hex[] = "0123456789abcdef";
+                    std::string expectedHex(expectedMac->size() * 2, '0');
+                    for (size_t i = 0; i < expectedMac->size(); ++i) {
+                        expectedHex[2 * i] = hex[(*expectedMac)[i] >> 4];
+                        expectedHex[2 * i + 1] = hex[(*expectedMac)[i] & 15];
+                    }
+                    listSaltMatched = (sig == expectedHex);
+                }
+                return std::string("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            });
+            tConnectSettings skewedAgent{};
+            skewedAgent.transfermode = static_cast<int>(sftp::TransferMode::php_agent);
+            skewedAgent.server = "http://127.0.0.1:" + std::to_string(peer.port) + "/sftp.php";
+            skewedAgent.password = "synthetic-pass";
+            std::string authErr;
+            check(PhpAgentValidateAuth(&skewedAgent, authErr) == SFTP_OK &&
+                  probeUnsigned && listClockCompensated && listSaltMatched,
+                  "PROBE is unsigned and compensates server Date clock offset + salt");
+        }
     }
     SetServerIdForName("shell", nullptr);
     SetServerIdForName("other", nullptr);

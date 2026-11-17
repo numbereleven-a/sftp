@@ -577,6 +577,7 @@
 #define IDS_DOWNLOAD_SKIP_ALL           12107
 #define IDS_CANCEL                      12108
 #define IDS_LOG_DOWNLOAD_SKIPPED        12109
+#define IDS_PHP_ERR_AGENT_OUTDATED      12110
 
 // Next default values for new objects
 //

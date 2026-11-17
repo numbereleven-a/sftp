@@ -26,8 +26,19 @@ try {
         $exe = Join-Path $outputDir "${test}.exe"
         $sources = '"tests\{0}.cpp"' -f $test
         if ($test -in @('crlf_test','sftpcrlf_test','trailcr_test')) { $sources += ' src\core\TextConversion.cpp' }
-        if ($test -eq 'lan3_test') { $sources += ' src\core\LanPair.cpp src\core\LanPairSession.cpp src\core\ProfileSettings.cpp src\core\TrustedInstallerToken.cpp src\core\DllExceptionBarrier.cpp' }
-        $command = 'call "{0}" >nul && cl /nologo /std:c++20 /EHsc /O2 /Gy /MT /FI global.h /DSFTP_ALLINONE /DLIBSSH2_API= /I src /I src\include {1} /Fo:"{2}" /Fe:"{3}" /link /OPT:REF ws2_32.lib bcrypt.lib crypt32.lib iphlpapi.lib advapi32.lib user32.lib shell32.lib ole32.lib' -f $toolchain, $sources, $obj, $exe
+        $extraIncludes = ''
+        $extraLibs = ''
+        if ($test -eq 'lan_transfer_test') {
+            $sources += ' src\core\LanPairProtocol.cpp'
+            $extraIncludes = ' /I thirdparty\mbedtls\include'
+            $extraLibs = (' src\lib\mbedcrypto_{0}.lib' -f $Architecture)
+        }
+        if ($test -eq 'lan3_test') {
+            $sources += ' src\core\LanPair.cpp src\core\LanPairProtocol.cpp src\core\LanPairSession.cpp src\core\ProfileSettings.cpp src\core\TrustedInstallerToken.cpp src\core\DllExceptionBarrier.cpp'
+            $extraIncludes = ' /I thirdparty\mbedtls\include'
+            $extraLibs = (' src\lib\mbedcrypto_{0}.lib' -f $Architecture)
+        }
+        $command = 'call "{0}" >nul && cl /nologo /std:c++20 /EHsc /O2 /Gy /MT /FI global.h /DSFTP_ALLINONE /DLIBSSH2_API= /I src /I src\include{4} {1} /Fo:"{2}" /Fe:"{3}" /link /OPT:REF{5} ws2_32.lib bcrypt.lib crypt32.lib iphlpapi.lib advapi32.lib user32.lib shell32.lib ole32.lib' -f $toolchain, $sources, $obj, $exe, $extraIncludes, $extraLibs
         & $env:COMSPEC /d /s /c $command
         if ($LASTEXITCODE -ne 0) { throw "Compilation failed: ${test}" }
     }

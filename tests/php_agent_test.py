@@ -100,6 +100,11 @@ def main():
             check(result[0] == 200, 'signed upload succeeded: ' + str(result))
             check(request('FINALIZE', extra={'path': 'uploaded.txt'})[0] == 200 and
                   (root / 'uploaded.txt').read_bytes() == b'ABCDEF', 'finalize succeeded')
+            empty_put = request('PUT', b'', extra={'path': 'empty.txt', 'offset': 0})
+            check(empty_put[0] == 200 and
+                  request('FINALIZE', extra={'path': 'empty.txt'})[0] == 200 and
+                  (root / 'empty.txt').read_bytes() == b'',
+                  'signed 0-byte upload and finalize succeeded')
             (root / 'retained').mkdir()
             (root / 'retained' / 'child.txt').write_text('keep')
             multipart = b'--boundary\r\nContent-Disposition: form-data; name="recursive"\r\n\r\n1\r\n--boundary--\r\n'

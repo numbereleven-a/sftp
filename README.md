@@ -79,7 +79,7 @@ Complete C-to-C++ rewrite of the original SFTP plugin by Christian Ghisler. Core
 | **Jump Host (ProxyJump)** | Bastion-routed SSH via `direct-tcpip` tunneling. No external `ssh.exe` required. |
 | **PHP Agent (HTTP)** | Standalone HTTP transfer mode backed by a single `sftp.php` file. Supports hosts with no SSH account or blocked subsystem. Directory uploads and batch file downloads transferred as a single TAR stream (opt-in via `php_tar` checkbox). TAR transfers replace thousands of individual HTTP requests with one POST/GET. |
 | **PHP Shell (HTTP)** | Pseudo-terminal over HTTP via `SHELL_EXEC` in `sftp.php`. Persistent command history (Up/Down arrows, 128-entry ring buffer) stored in `%APPDATA%\GHISLER\shell_history.txt`. Maintains working-directory context across requests. |
-| **LAN Pair** | Direct Windows-to-Windows pairing mode. Custom LAN3 authentication and authenticated file-transfer frames, UDP broadcast peer discovery. |
+| **LAN Pair** | Direct Windows-to-Windows pairing mode. SPAKE2 (P-256) authentication and AES-256-GCM encrypted file-transfer frames, UDP broadcast peer discovery. |
 
 ### Authentication Methods
 
@@ -97,7 +97,7 @@ Complete C-to-C++ rewrite of the original SFTP plugin by Christian Ghisler. Core
 - Windows DPAPI (`CryptProtectData`) for password storage at the Windows account level.
 - TC Master Password integration via `CryptProc` API with `!` sentinel.
 - `SecureZeroMemory` on all sensitive buffers after use.
-- PBKDF2-HMAC-SHA256 (120,000 iterations) and HMAC-SHA-256 challenge-response in LAN Pair auth.
+- PBKDF2-HMAC-SHA256 (120,000 iterations), SPAKE2 (RFC 9382, P-256), and AES-256-GCM encrypted frames in LAN Pair.
 - DPAPI-protected LAN Pair trust keys stored persistently per peer pair.
 - `DllExceptionBarrier` — C++ exception firewall at every exported entry point; prevents any exception from crossing the ABI boundary into Total Commander (which would cause an immediate host crash).
 - Legacy XOR passwords: read-only backward compatibility, never written for new profiles.
@@ -522,10 +522,10 @@ Direct Windows-to-Windows file transfer without SSH. Uses a custom application-l
 
 ### LAN3 Authentication
 
-Both peers must run the current LAN3 protocol. Initial pairing requires the same password.
-The donor generates a random PBKDF2 salt and challenge. Both peers verify proofs covering
-the entire handshake, derive a trust key locally, and persist it with DPAPI.
-Trust keys are never sent over the network. Existing older pairings must be recreated.
+Both peers must run v10.3.1.0 or newer. Initial pairing requires the same non-empty password.
+Both peers derive a shared pair key with PBKDF2-HMAC-SHA256 (120,000 iterations, deterministic per-pair salt),
+exchange ephemeral SPAKE2 (RFC 9382, P-256) shares and mutual HMAC confirmations,
+and persist the trust key locally via DPAPI. Neither the password nor a reusable verifier crosses the wire. Existing older pairings must be recreated.
 
 ### LAN Pair Roles
 
@@ -552,9 +552,9 @@ Re-enter the shared password to recreate trust after updating older peers.
 
 ### LAN3 File Transfer
 
-Commands, responses, directory entries, and file data use authenticated frames.
-Each direction has its own key and increasing sequence number; modified and replayed
-frames are rejected. Authentication protects integrity; this transport does not encrypt file data.
+Commands, responses, directory entries, and file data travel inside AES-256-GCM encrypted frames.
+Each direction uses its own 256-bit key, 4-byte salt, and strictly increasing 64-bit sequence number;
+altered, replayed, or reordered frames terminate the session immediately.
 
 The donor shares only the folder selected with **Pair**. Paths outside that folder,
 parent traversal, device paths, alternate streams, and reparse points are rejected.
@@ -820,8 +820,9 @@ Remote `locale` command output is parsed to determine the server's character enc
 | `SessionImport.cpp` | PuTTY / WinSCP registry + Portable + KiTTY Portable → INI | Non-destructive merge |
 | `ServerRegistry.cpp` | In-memory server profile registry | |
 | `ProfileSettings.cpp` | INI read/write for connection profiles | |
-| `LanPair.cpp` | LAN3 authentication, UDP discovery, PBKDF2 | `namespace smb` |
-| `LanPairSession.cpp` | LAN3 authenticated file protocol, file transfer session | `noexcept` public API; session timeout enforcement |
+| `LanPair.cpp` | LAN3 authentication, UDP discovery, PBKDF2 | `LanPairProtocol.cpp` |
+| `LanPairProtocol.cpp` | SPAKE2 (RFC 9382, P-256) and AES-256-GCM framing | `LanPairProtocol.h` |
+| `LanPairSession.cpp` | LAN3 encrypted file protocol, file transfer session | `noexcept` public API; session timeout enforcement |
 | `Libssh2Backend.cpp` | `ISshBackend` implementation over libssh2 | |
 | `AuthMethodParser.cpp` | Parses server-advertised auth method list | |
 | `CoreUtils.cpp` | Base64, time conversion, string utilities | Self-contained |
